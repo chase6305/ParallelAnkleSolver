@@ -424,5 +424,34 @@ TEST(ImplicitConstraints, NormalizeRowsAndDependentCoordinateUnits) {
     EXPECT_EQ(DifferentiateImplicitly(a, Eigen::Vector2d::Zero()).status, Status::InvalidInput);
 }
 
+TEST(ConstraintsScaling, PreserveRepresentableCombinedRowAndColumnScales) {
+    for (int direction : {-1, 1}) {
+        SCOPED_TRACE(direction);
+        const Eigen::MatrixXd a = Eigen::MatrixXd::Constant(1, 1, std::ldexp(1.0, 900 * direction));
+        const Eigen::VectorXd rhs = Eigen::VectorXd::Constant(1, std::ldexp(1.0, 400 * direction));
+        const double row_scale = std::ldexp(1.0, -500 * direction);
+        const double column_scale = std::ldexp(1.0, -700 * direction);
+        const double expected = std::ldexp(1.0, -500 * direction);
+
+        SolveOptions solve_options;
+        solve_options.residual_scales = Eigen::VectorXd::Constant(1, row_scale);
+        solve_options.variable_scales = Eigen::VectorXd::Constant(1, column_scale);
+        solve_options.residual_tolerance = std::ldexp(1.0, -950);
+        solve_options.damping = 0.0;
+        const auto solved = SolveEqualities(AffineProblem(a, rhs), Eigen::VectorXd::Zero(1), solve_options);
+        ASSERT_TRUE(solved.success()) << solved.message;
+        EXPECT_EQ(solved.x(0), expected);
+        EXPECT_TRUE(solved.full_column_rank);
+
+        DerivativeOptions derivative_options;
+        derivative_options.equation_scales = solve_options.residual_scales;
+        derivative_options.variable_scales = solve_options.variable_scales;
+        const auto differentiated = DifferentiateImplicitly(a, rhs, derivative_options);
+        ASSERT_TRUE(differentiated.success()) << differentiated.message;
+        EXPECT_EQ(differentiated.derivative(0, 0), -expected);
+        EXPECT_EQ(differentiated.relative_residual, 0.0);
+    }
+}
+
 }  // namespace
 }  // namespace parallel_ankle::constraints

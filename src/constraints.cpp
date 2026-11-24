@@ -65,8 +65,35 @@ Evaluation EvaluateJacobian(const EqualityProblem& problem, const Eigen::VectorX
 void ScaleJacobian(Eigen::MatrixXd& matrix,
                    const Eigen::VectorXd& row_scales,
                    const Eigen::VectorXd& column_scales) {
-    matrix.array().colwise() /= row_scales.array();
-    matrix.array().rowwise() *= column_scales.transpose().array();
+    if ((row_scales.array() == 1.0).all()) {
+        matrix.array().rowwise() *= column_scales.transpose().array();
+        return;
+    }
+    for (Eigen::Index column = 0; column < matrix.cols(); ++column) {
+        const double column_scale = column_scales(column);
+        for (Eigen::Index row = 0; row < matrix.rows(); ++row) {
+            double& value = matrix(row, column);
+            if (value == 0.0) {
+                continue;
+            }
+            const double row_scale = row_scales(row);
+            const double divided = value / row_scale;
+            if (std::isnormal(divided)) {
+                value = divided * column_scale;
+                continue;
+            }
+            // Apply both scales in exponent space when the division alone
+            // would overflow or discard significant bits in a subnormal.
+            int value_exponent;
+            int row_exponent;
+            int column_exponent;
+            const double value_fraction = std::frexp(value, &value_exponent);
+            const double row_fraction = std::frexp(row_scale, &row_exponent);
+            const double column_fraction = std::frexp(column_scale, &column_exponent);
+            value = std::ldexp((value_fraction / row_fraction) * column_fraction,
+                               value_exponent - row_exponent + column_exponent);
+        }
+    }
 }
 
 double DampedInverse(double singular_value, double damping) {
