@@ -99,6 +99,29 @@ TEST(ForwardKinematics, RecoverPosesForBothFeet) {
     }
 }
 
+TEST(ForwardKinematics, ReuseTheAcceptedPoseAfterAnUnreachableNewtonStep) {
+    const PMAnkle ankle(true, LegacyParams(true));
+    const Eigen::Vector2d expected(0.2, -0.4);
+    const auto target = ankle.GetAnkleMotorAngles(expected.x(), expected.y());
+    ASSERT_TRUE(target.success());
+
+    ForwardOptions options;
+    options.initial_guess = {-0.8, 0.2};
+    const auto initial = ankle.GetAnkleMotorAngles(options.initial_guess.x(), options.initial_guess.y());
+    ASSERT_TRUE(initial.success());
+    const Eigen::Matrix2d jacobian = ankle.ComputeJacobian(options.initial_guess.x(), options.initial_guess.y());
+    const Eigen::Vector2d step = jacobian.fullPivLu().solve(initial.motor_angles() - target.motor_angles());
+    const Eigen::Vector2d full_step = options.initial_guess - step;
+    ASSERT_FALSE(ankle.GetAnkleMotorAngles(full_step.x(), full_step.y()).success());
+
+    const auto result = ankle.SolveForwardKinematics(target.theta_1_rad, target.theta_2_rad, options);
+    ASSERT_TRUE(result.success()) << ToString(result.status);
+    EXPECT_GT(result.iterations, 1);
+    EXPECT_LT((result.pose - expected).norm(), 2e-8);
+    EXPECT_LE(result.residual_norm, options.tolerance_rad);
+    ExpectRodClosure(ankle.parameters(), result.pose, target.motor_angles());
+}
+
 TEST(ForwardKinematics, ReportInvalidInputsAndIterationLimit) {
     const PMAnkle ankle(true, LegacyParams(true));
     EXPECT_EQ(ankle.SolveForwardKinematics(kNaN, 0.0).status, ForwardStatus::InvalidInput);

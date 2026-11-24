@@ -24,9 +24,16 @@ struct FootTransform {
     Eigen::Matrix3d roll;
 };
 
+Eigen::Matrix3d PitchRotation(double pitch) {
+    return Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()).toRotationMatrix();
+}
+
+Eigen::Matrix3d RollRotation(double roll) {
+    return Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()).toRotationMatrix();
+}
+
 FootTransform MakeTransform(double pitch, double roll) {
-    return {Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()).toRotationMatrix(),
-            Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()).toRotationMatrix()};
+    return {PitchRotation(pitch), RollRotation(roll)};
 }
 
 struct ActuatorPose {
@@ -111,6 +118,19 @@ AnklePose SolveAnklePose(const FootTransform& transform, const AnkleParams& p) {
     return {transform.pitch,
             {SolveActuatorPose(transform, p.r_a1, p.r_c1, p.l_bar1, p.l_rod1, p.alpha_1_rad, p.is_left_motor1, p),
              SolveActuatorPose(transform, p.r_a2, p.r_c2, p.l_bar2, p.l_rod2, p.alpha_2_rad, p.is_left_motor2, p)}};
+}
+
+AnkleIKSolution SolveMotorAngles(const FootTransform& transform, const AnkleParams& params) {
+    const auto pose = SolveAnklePose(transform, params);
+    const auto& [first, second] = pose.actuators;
+    AnkleIKSolution solution;
+    solution.theta_1_rad = first.theta;
+    solution.theta_2_rad = second.theta;
+    solution.status_1 = first.status;
+    solution.status_2 = second.status;
+    solution.success_1 = solution.status_1 == InverseStatus::Success;
+    solution.success_2 = solution.status_2 == InverseStatus::Success;
+    return solution;
 }
 
 struct ActuatorDifferential {
@@ -286,16 +306,7 @@ AnkleIKSolution PMAnkle::GetAnkleMotorAngles(double q_pitch_rad, double q_roll_r
     if (!std::isfinite(q_pitch_rad) || !std::isfinite(q_roll_rad)) {
         return {};
     }
-    const auto pose = SolveAnklePose(MakeTransform(q_pitch_rad, q_roll_rad), params_);
-    const auto& [first, second] = pose.actuators;
-    AnkleIKSolution solution;
-    solution.theta_1_rad = first.theta;
-    solution.theta_2_rad = second.theta;
-    solution.status_1 = first.status;
-    solution.status_2 = second.status;
-    solution.success_1 = solution.status_1 == InverseStatus::Success;
-    solution.success_2 = solution.status_2 == InverseStatus::Success;
-    return solution;
+    return SolveMotorAngles(MakeTransform(q_pitch_rad, q_roll_rad), params_);
 }
 
 Eigen::Matrix2d PMAnkle::ComputeJacobian(double q_pitch_rad, double q_roll_rad) const {
@@ -317,14 +328,17 @@ Eigen::Matrix2d PMAnkle::ComputeNumericalJacobian(double q_pitch_rad, double q_r
     if (!std::isfinite(eps) || eps <= 0.0 || !std::isfinite(q_pitch_rad) || !std::isfinite(q_roll_rad)) {
         throw std::invalid_argument("Jacobian angles must be finite and its step must be positive and finite");
     }
-    const double pitch_step = (q_pitch_rad + eps) - q_pitch_rad;
-    const double roll_step = (q_roll_rad + eps) - q_roll_rad;
+    const double perturbed_pitch = q_pitch_rad + eps;
+    const double perturbed_roll = q_roll_rad + eps;
+    const double pitch_step = perturbed_pitch - q_pitch_rad;
+    const double roll_step = perturbed_roll - q_roll_rad;
     if (!std::isfinite(pitch_step) || !std::isfinite(roll_step) || pitch_step == 0.0 || roll_step == 0.0) {
         throw std::invalid_argument("Jacobian step does not produce a finite representable perturbation");
     }
-    const auto zero = GetAnkleMotorAngles(q_pitch_rad, q_roll_rad);
-    const auto pitch = GetAnkleMotorAngles(q_pitch_rad + eps, q_roll_rad);
-    const auto roll = GetAnkleMotorAngles(q_pitch_rad, q_roll_rad + eps);
+    const auto base = MakeTransform(q_pitch_rad, q_roll_rad);
+    const auto zero = SolveMotorAngles(base, params_);
+    const auto pitch = SolveMotorAngles({PitchRotation(perturbed_pitch), base.roll}, params_);
+    const auto roll = SolveMotorAngles({base.pitch, RollRotation(perturbed_roll)}, params_);
     if (!zero.success() || !pitch.success() || !roll.success()) {
         throw std::domain_error("cannot compute ankle Jacobian at an unreachable IK stencil");
     }

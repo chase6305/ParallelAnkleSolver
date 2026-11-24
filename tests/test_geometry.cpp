@@ -148,6 +148,9 @@ TEST(Geometry, RejectTransmissionSingularityWhileKeepingReachableIk) {
     ASSERT_TRUE(ik.success());
     ExpectRodClosure(ankle.parameters(), Eigen::Vector2d::Zero(), ik.motor_angles());
     EXPECT_THROW(ankle.ComputeJacobian(0.0, 0.0), std::domain_error);
+    const auto closed_at_initial_guess = ankle.SolveForwardKinematics(ik.theta_1_rad, ik.theta_2_rad);
+    EXPECT_TRUE(closed_at_initial_guess.success());
+    EXPECT_EQ(closed_at_initial_guess.iterations, 0);
     EXPECT_EQ(ankle.SolveForwardKinematics(ik.theta_1_rad + 0.01, ik.theta_2_rad - 0.01).status,
               ForwardStatus::Singular);
 }
