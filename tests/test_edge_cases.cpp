@@ -35,6 +35,27 @@ TEST(NumericalJacobianEdges, RejectInvalidStepAndAngles) {
     }
 }
 
+TEST(NumericalJacobianEdges, UseTheActualStepOnEachPerturbedAxis) {
+    constexpr double kPeriod = 6.28318530717958647693;
+    const PMAnkle ankle(true, LegacyParams(true));
+    const Eigen::Vector2d pose(1024.0 * kPeriod + 0.2, -64.0 * kPeriod - 0.1);
+    constexpr double eps = 1.7e-12;
+    const auto base = ankle.GetAnkleMotorAngles(pose.x(), pose.y());
+    ASSERT_TRUE(base.success());
+
+    const auto jacobian = ankle.ComputeNumericalJacobian(pose.x(), pose.y(), eps);
+    for (int axis = 0; axis < 2; ++axis) {
+        Eigen::Vector2d perturbed = pose;
+        perturbed(axis) += eps;
+        const double step = perturbed(axis) - pose(axis);
+        ASSERT_NE(step, eps);
+        const auto shifted = ankle.GetAnkleMotorAngles(perturbed.x(), perturbed.y());
+        ASSERT_TRUE(shifted.success());
+        const Eigen::Vector2d expected = (shifted.motor_angles() - base.motor_angles()) / step;
+        EXPECT_EQ(jacobian.col(axis), expected);
+    }
+}
+
 TEST(InverseKinematicsEdges, PreserveIndependentActuatorFailures) {
     auto params = LegacyParams(true);
     params.l_rod1 = 1.0;
