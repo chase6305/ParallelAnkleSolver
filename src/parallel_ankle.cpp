@@ -3,10 +3,13 @@
 #include <Eigen/Geometry>
 #include <Eigen/LU>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
+#include "ankle_derivatives.h"
 #include "crank_geometry.h"
 
 namespace parallel_ankle {
@@ -14,6 +17,7 @@ namespace {
 
 constexpr double kSingularThreshold = 1e-10;
 constexpr double kAngleRepresentationTolerance = 1e-12;
+constexpr double kTransmissionTolerance = 128.0 * std::numeric_limits<double>::epsilon();
 
 struct FootTransform {
     Eigen::Matrix3d pitch;
@@ -25,99 +29,137 @@ FootTransform MakeTransform(double pitch, double roll) {
             Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()).toRotationMatrix()};
 }
 
-struct ActuatorSolution {
+struct ActuatorPose {
+    Eigen::Vector3d rolled;
+    Eigen::Vector3d pitch_relative;
+    Eigen::Vector3d delta;
+    double bar;
+    double rod;
+    double side;
+    double direction;
+    double gamma = std::numeric_limits<double>::quiet_NaN();
     double theta = std::numeric_limits<double>::quiet_NaN();
     InverseStatus status = InverseStatus::Unreachable;
-    Eigen::RowVector2d jacobian = Eigen::RowVector2d::Constant(std::numeric_limits<double>::quiet_NaN());
-    bool differentiable = false;
 };
 
-ActuatorSolution SolveSingle(const FootTransform& transform,
-                            const Eigen::Vector3d& motor_center,
-                            const Eigen::Vector3d& foot_point,
-                            double bar,
-                            double rod,
-                            double offset,
-                            bool is_left_motor,
-                            const AnkleParams& geometry,
-                            bool differentiate) {
-    ActuatorSolution result;
+ActuatorPose SolveActuatorPose(const FootTransform& transform,
+                               const Eigen::Vector3d& motor_center,
+                               const Eigen::Vector3d& foot_point,
+                               double bar,
+                               double rod,
+                               double offset,
+                               bool is_left_motor,
+                               const AnkleParams& geometry) {
     const Eigen::Vector3d rolled = transform.roll * (foot_point - geometry.r_roll_center);
     // Keep every sum in relative coordinates. Forming a huge world-space C
     // before subtracting A can erase an otherwise representable local motion.
     const Eigen::Vector3d pitch_relative = transform.pitch *
                                           (rolled + (geometry.r_roll_center - geometry.r_pitch_center));
     const Eigen::Vector3d delta = pitch_relative + (geometry.r_pitch_center - motor_center);
+    const double initial_side = foot_point.y() - motor_center.y();
+    const double side = std::copysign(1.0, initial_side);
+    const double direction = is_left_motor ? 1.0 : -1.0;
+    ActuatorPose result{rolled, pitch_relative, delta, bar, rod, side, direction};
     if (!delta.allFinite()) {
         return result;
     }
-    const double initial_side = foot_point.y() - motor_center.y();
     if (initial_side == 0.0) {
         result.status = InverseStatus::Singular;
         return result;
     }
-    const double side = std::copysign(1.0, initial_side);
     const auto phase = detail::SolveCrankPhase(delta, bar, rod, side);
     if (phase.status != InverseStatus::Success) {
         result.status = phase.status;
         return result;
     }
     const double gamma = phase.gamma;
-    const double direction = is_left_motor ? 1.0 : -1.0;
-    result.theta = direction * gamma + offset;
+    const double theta = direction * gamma + offset;
     // A finite but very large encoder offset can erase gamma in theta=offset+gamma.
     // Validate the angle that a caller can actually reconstruct from our output.
-    const double encoded_gamma = direction * (result.theta - offset);
-    if (!std::isfinite(result.theta) || !std::isfinite(encoded_gamma) ||
+    const double encoded_gamma = direction * (theta - offset);
+    if (!std::isfinite(theta) || !std::isfinite(encoded_gamma) ||
         std::abs(encoded_gamma - gamma) > kAngleRepresentationTolerance) {
-        ActuatorSolution failure;
-        failure.status = InverseStatus::NumericalFailure;
-        return failure;
+        result.status = InverseStatus::NumericalFailure;
+        return result;
     }
     // The phase solver already checked closure and the working root at gamma.
     if (encoded_gamma != gamma) {
         const auto encoded_phase = detail::CheckCrankPhase(delta, bar, rod, side, encoded_gamma);
         if (!encoded_phase.rod_closes || !encoded_phase.selected_working_root) {
-            ActuatorSolution failure;
-            failure.status = InverseStatus::NumericalFailure;
-            return failure;
-        }
-    }
-    result.status = InverseStatus::Success;
-    if (differentiate) {
-        const double scale = std::max({delta.cwiseAbs().maxCoeff(), bar, rod});
-        const Eigen::Vector3d r = delta / scale;
-        const double length = bar / scale;
-        const double sine = std::sin(gamma);
-        const double cosine = std::cos(gamma);
-        const Eigen::Vector3d crank(0.0, side * cosine, sine);
-        const Eigen::Vector3d link = r - length * crank;
-        const Eigen::Vector3d crank_derivative(0.0, -side * sine, cosine);
-        const double transmission = length * r.dot(crank_derivative);
-        if (std::abs(transmission) <= detail::kCrankBranchTolerance * length * r.stableNorm()) {
+            result.status = InverseStatus::NumericalFailure;
             return result;
         }
-        const Eigen::Vector3d c_pitch = Eigen::Vector3d::UnitY().cross(pitch_relative / scale);
-        const Eigen::Vector3d c_roll = transform.pitch * Eigen::Vector3d::UnitX().cross(rolled / scale);
-        result.jacobian << direction * link.dot(c_pitch) / transmission,
-                           direction * link.dot(c_roll) / transmission;
-        result.differentiable = result.jacobian.allFinite();
     }
+    result.gamma = gamma;
+    result.theta = theta;
+    result.status = InverseStatus::Success;
     return result;
 }
 
-std::pair<ActuatorSolution, ActuatorSolution> SolveActuators(double pitch,
-                                                          double roll,
-                                                          const AnkleParams& p,
-                                                          bool differentiate = false) {
-    if (!std::isfinite(pitch) || !std::isfinite(roll)) {
-        ActuatorSolution invalid;
-        invalid.status = InverseStatus::InvalidInput;
-        return {invalid, invalid};
+struct AnklePose {
+    Eigen::Matrix3d pitch_rotation;
+    std::array<ActuatorPose, 2> actuators;
+
+    bool success() const {
+        return actuators[0].status == InverseStatus::Success && actuators[1].status == InverseStatus::Success;
     }
-    const auto transform = MakeTransform(pitch, roll);
-    return {SolveSingle(transform, p.r_a1, p.r_c1, p.l_bar1, p.l_rod1, p.alpha_1_rad, p.is_left_motor1, p, differentiate),
-            SolveSingle(transform, p.r_a2, p.r_c2, p.l_bar2, p.l_rod2, p.alpha_2_rad, p.is_left_motor2, p, differentiate)};
+
+    Eigen::Vector2d motor_angles() const { return {actuators[0].theta, actuators[1].theta}; }
+};
+
+AnklePose SolveAnklePose(const FootTransform& transform, const AnkleParams& p) {
+    return {transform.pitch,
+            {SolveActuatorPose(transform, p.r_a1, p.r_c1, p.l_bar1, p.l_rod1, p.alpha_1_rad, p.is_left_motor1, p),
+             SolveActuatorPose(transform, p.r_a2, p.r_c2, p.l_bar2, p.l_rod2, p.alpha_2_rad, p.is_left_motor2, p)}};
+}
+
+struct ActuatorDifferential {
+    Eigen::Vector3d rolled;
+    Eigen::Vector3d r;
+    Eigen::Vector3d crank;
+    Eigen::Vector3d crank_derivative;
+    Eigen::Vector3d link;
+    Eigen::Matrix<double, 3, 2> first;
+    Eigen::RowVector2d jacobian;
+    double length;
+    double transmission;
+};
+
+bool DifferentiateActuator(const ActuatorPose& actuator,
+                          const Eigen::Matrix3d& pitch_rotation,
+                          ActuatorDifferential& differential) {
+    const double scale = std::max({actuator.delta.cwiseAbs().maxCoeff(), actuator.bar, actuator.rod});
+    differential.r = actuator.delta / scale;
+    differential.length = actuator.bar / scale;
+    const double sine = std::sin(actuator.gamma);
+    const double cosine = std::cos(actuator.gamma);
+    differential.crank = Eigen::Vector3d(0.0, actuator.side * cosine, sine);
+    differential.crank_derivative = Eigen::Vector3d(0.0, -actuator.side * sine, cosine);
+    differential.transmission = differential.length * differential.r.dot(differential.crank_derivative);
+    const double singular_threshold = kTransmissionTolerance * differential.length * differential.r.stableNorm();
+    if (std::abs(differential.transmission) <= singular_threshold) {
+        return false;
+    }
+    differential.link = differential.r - differential.length * differential.crank;
+    differential.rolled = actuator.rolled / scale;
+    differential.first.col(0) = Eigen::Vector3d::UnitY().cross(actuator.pitch_relative / scale);
+    differential.first.col(1) = pitch_rotation * Eigen::Vector3d::UnitX().cross(differential.rolled);
+    for (int j = 0; j < 2; ++j) {
+        differential.jacobian(j) = actuator.direction * differential.link.dot(differential.first.col(j)) /
+                                   differential.transmission;
+    }
+    return differential.jacobian.allFinite();
+}
+
+bool DifferentiateAnkle(const AnklePose& pose, Eigen::Matrix2d& jacobian) {
+    for (int i = 0; i < 2; ++i) {
+        ActuatorDifferential differential;
+        if (!DifferentiateActuator(pose.actuators[i], pose.pitch_rotation, differential)) {
+            return false;
+        }
+        jacobian.row(i) = differential.jacobian;
+    }
+    return true;
 }
 
 Eigen::FullPivLU<Eigen::Matrix2d> FactorJacobian(const Eigen::Matrix2d& matrix) {
@@ -148,7 +190,61 @@ Eigen::Vector2d SolveLinear(const Eigen::Matrix2d& matrix, const Eigen::Vector2d
     return result;
 }
 
+Eigen::Matrix2d DifferentiateActuatorTwice(const ActuatorPose& actuator,
+                                          const Eigen::Matrix3d& pitch_rotation,
+                                          const ActuatorDifferential& differential) {
+    const auto& first = differential.first;
+    const Eigen::Vector3d pp = Eigen::Vector3d::UnitY().cross(first.col(0));
+    const Eigen::Vector3d pr = Eigen::Vector3d::UnitY().cross(first.col(1));
+    const Eigen::Vector3d rr = pitch_rotation * Eigen::Vector3d::UnitX().cross(
+                                                   Eigen::Vector3d::UnitX().cross(differential.rolled));
+    const Eigen::Vector2d gradient = actuator.direction * differential.jacobian.transpose();
+    Eigen::Matrix2d hessian;
+    for (int j = 0; j < 2; ++j) {
+        for (int k = j; k < 2; ++k) {
+            const Eigen::Vector3d& second = j == 0 && k == 0 ? pp : (j == 1 && k == 1 ? rr : pr);
+            const double numerator = first.col(j).dot(first.col(k)) + differential.link.dot(second) -
+                                     differential.length *
+                                         (first.col(j).dot(differential.crank_derivative) * gradient(k) +
+                                          first.col(k).dot(differential.crank_derivative) * gradient(j)) +
+                                     differential.length * differential.r.dot(differential.crank) *
+                                         gradient(j) * gradient(k);
+            const double value = actuator.direction * numerator / differential.transmission;
+            hessian(j, k) = value;
+            hessian(k, j) = value;
+        }
+    }
+    if (!hessian.allFinite()) {
+        throw std::overflow_error("ankle angle Hessian produced nonfinite entries");
+    }
+    return hessian;
+}
+
 }  // namespace
+
+detail::AnkleDerivatives detail::EvaluateAnkleDerivatives(const AnkleParams& params, double pitch, double roll) {
+    if (!std::isfinite(pitch) || !std::isfinite(roll)) {
+        throw std::invalid_argument("second-order task angles must be finite");
+    }
+    const auto pose = SolveAnklePose(MakeTransform(pitch, roll), params);
+    if (!pose.success()) {
+        throw std::domain_error("cannot differentiate outside the supported ankle IK branch");
+    }
+    // Both orders differentiate the same selected geometric angle, before
+    // the encoder's rounding can perturb the transmission near a fold.
+    std::array<ActuatorDifferential, 2> differentials;
+    AnkleDerivatives derivatives;
+    for (int i = 0; i < 2; ++i) {
+        if (!DifferentiateActuator(pose.actuators[i], pose.pitch_rotation, differentials[i])) {
+            throw std::domain_error("ankle actuator transmission is singular");
+        }
+        derivatives.jacobian.row(i) = differentials[i].jacobian;
+    }
+    for (int i = 0; i < 2; ++i) {
+        derivatives.hessians[i] = DifferentiateActuatorTwice(pose.actuators[i], pose.pitch_rotation, differentials[i]);
+    }
+    return derivatives;
+}
 
 const char* ToString(InverseStatus status) {
     switch (status) {
@@ -187,12 +283,16 @@ PMAnkle::PMAnkle(bool is_left, const AnkleParams& params) : is_left_(is_left), p
 }
 
 AnkleIKSolution PMAnkle::GetAnkleMotorAngles(double q_pitch_rad, double q_roll_rad) const {
-    const auto motors = SolveActuators(q_pitch_rad, q_roll_rad, params_);
+    if (!std::isfinite(q_pitch_rad) || !std::isfinite(q_roll_rad)) {
+        return {};
+    }
+    const auto pose = SolveAnklePose(MakeTransform(q_pitch_rad, q_roll_rad), params_);
+    const auto& [first, second] = pose.actuators;
     AnkleIKSolution solution;
-    solution.theta_1_rad = motors.first.theta;
-    solution.theta_2_rad = motors.second.theta;
-    solution.status_1 = motors.first.status;
-    solution.status_2 = motors.second.status;
+    solution.theta_1_rad = first.theta;
+    solution.theta_2_rad = second.theta;
+    solution.status_1 = first.status;
+    solution.status_2 = second.status;
     solution.success_1 = solution.status_1 == InverseStatus::Success;
     solution.success_2 = solution.status_2 == InverseStatus::Success;
     return solution;
@@ -202,16 +302,14 @@ Eigen::Matrix2d PMAnkle::ComputeJacobian(double q_pitch_rad, double q_roll_rad) 
     if (!std::isfinite(q_pitch_rad) || !std::isfinite(q_roll_rad)) {
         throw std::invalid_argument("Jacobian angles must be finite");
     }
-    const auto motors = SolveActuators(q_pitch_rad, q_roll_rad, params_, true);
-    if (motors.first.status != InverseStatus::Success || motors.second.status != InverseStatus::Success) {
+    const auto pose = SolveAnklePose(MakeTransform(q_pitch_rad, q_roll_rad), params_);
+    if (!pose.success()) {
         throw std::domain_error("cannot compute ankle Jacobian outside the valid IK branch");
     }
-    if (!motors.first.differentiable || !motors.second.differentiable) {
+    Eigen::Matrix2d jacobian;
+    if (!DifferentiateAnkle(pose, jacobian)) {
         throw std::domain_error("ankle actuator transmission is singular");
     }
-    Eigen::Matrix2d jacobian;
-    jacobian.row(0) = motors.first.jacobian;
-    jacobian.row(1) = motors.second.jacobian;
     return jacobian;
 }
 
@@ -259,21 +357,22 @@ AnkleFKSolution PMAnkle::SolveForwardKinematics(double theta_1_rad,
         result.status = ForwardStatus::Unreachable;
         return result;
     }
+    auto evaluation = SolveAnklePose(MakeTransform(result.pose(0), result.pose(1)), params_);
+    if (!evaluation.success()) {
+        const auto& [first, second] = evaluation.actuators;
+        if (first.status == InverseStatus::NumericalFailure || second.status == InverseStatus::NumericalFailure) {
+            result.status = ForwardStatus::NumericalFailure;
+        } else if (first.status == InverseStatus::Singular || second.status == InverseStatus::Singular) {
+            result.status = ForwardStatus::Singular;
+        } else {
+            result.status = ForwardStatus::Unreachable;
+        }
+        return result;
+    }
+    Eigen::Vector2d residual = evaluation.motor_angles() - target;
+    result.residual_norm = residual.stableNorm();
     for (int iteration = 0; iteration <= options.max_iterations; ++iteration) {
         result.iterations = iteration;
-        const auto ik = GetAnkleMotorAngles(result.pose(0), result.pose(1));
-        if (!ik.success()) {
-            if (ik.status_1 == InverseStatus::NumericalFailure || ik.status_2 == InverseStatus::NumericalFailure) {
-                result.status = ForwardStatus::NumericalFailure;
-            } else if (ik.status_1 == InverseStatus::Singular || ik.status_2 == InverseStatus::Singular) {
-                result.status = ForwardStatus::Singular;
-            } else {
-                result.status = ForwardStatus::Unreachable;
-            }
-            return result;
-        }
-        const Eigen::Vector2d residual = ik.motor_angles() - target;
-        result.residual_norm = residual.stableNorm();
         if (result.residual_norm <= options.tolerance_rad) {
             result.status = ForwardStatus::Success;
             return result;
@@ -284,9 +383,7 @@ AnkleFKSolution PMAnkle::SolveForwardKinematics(double theta_1_rad,
         }
 
         Eigen::Matrix2d jacobian;
-        try {
-            jacobian = ComputeJacobian(result.pose(0), result.pose(1));
-        } catch (const std::domain_error&) {
+        if (!DifferentiateAnkle(evaluation, jacobian)) {
             result.status = ForwardStatus::Singular;
             return result;
         }
@@ -303,15 +400,25 @@ AnkleFKSolution PMAnkle::SolveForwardKinematics(double theta_1_rad,
 
         bool accepted = false;
         double scale = 1.0;
-        for (int attempt = 0; attempt < 12; ++attempt) {
+        for (int attempt = 0; attempt < 12; ++attempt, scale *= 0.5) {
             const Eigen::Vector2d candidate = result.pose - scale * step;
-            const auto candidate_ik = GetAnkleMotorAngles(candidate(0), candidate(1));
-            if (candidate_ik.success() && (candidate_ik.motor_angles() - target).stableNorm() < result.residual_norm) {
+            if (!candidate.allFinite()) {
+                continue;
+            }
+            auto candidate_evaluation = SolveAnklePose(MakeTransform(candidate(0), candidate(1)), params_);
+            if (!candidate_evaluation.success()) {
+                continue;
+            }
+            const Eigen::Vector2d candidate_residual = candidate_evaluation.motor_angles() - target;
+            const double candidate_norm = candidate_residual.stableNorm();
+            if (candidate_norm < result.residual_norm) {
                 result.pose = candidate;
+                result.residual_norm = candidate_norm;
+                residual = candidate_residual;
+                evaluation = std::move(candidate_evaluation);
                 accepted = true;
                 break;
             }
-            scale *= 0.5;
         }
         if (!accepted) {
             result.status = ForwardStatus::NoProgress;
