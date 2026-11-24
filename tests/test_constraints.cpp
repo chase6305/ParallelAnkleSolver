@@ -186,6 +186,41 @@ TEST(EqualityConstraints, DistinguishMalformedAndFailedCallbacks) {
     EXPECT_EQ(SolveEqualities(problem, Eigen::VectorXd::Zero(1)).status, Status::InvalidEvaluation);
 }
 
+TEST(EqualityConstraints, RejectPartiallyWrittenOutputsAfterASuccessfulEvaluation) {
+    for (bool omit_jacobian_entry : {false, true}) {
+        SCOPED_TRACE(omit_jacobian_entry);
+        int residual_calls = 0;
+        int jacobian_calls = 0;
+        EqualityProblem problem;
+        problem.variables = problem.equations = 2;
+        problem.residual = [&](const Eigen::VectorXd& x, Eigen::VectorXd& residual) {
+            residual(0) = x(0) * x(0) - 1.0;
+            ++residual_calls;
+            if (omit_jacobian_entry || residual_calls <= 2) {
+                residual(1) = x(1) - 2.0;
+            }
+            return true;
+        };
+        problem.jacobian = [&](const Eigen::VectorXd& x, Eigen::MatrixXd& jacobian) {
+            jacobian(0, 0) = 2.0 * x(0);
+            jacobian(0, 1) = jacobian(1, 0) = 0.0;
+            ++jacobian_calls;
+            if (!omit_jacobian_entry || jacobian_calls == 1) {
+                jacobian(1, 1) = 1.0;
+            }
+            return true;
+        };
+        SolveOptions options;
+        options.damping = 0.0;
+        const auto result = SolveEqualities(problem, Eigen::Vector2d(0.5, 0.0), options);
+        EXPECT_EQ(result.status, Status::InvalidEvaluation);
+        EXPECT_EQ(result.iterations, 1);
+        EXPECT_EQ(result.x, Eigen::Vector2d(1.25, 2.0));
+        EXPECT_EQ(result.residual_evaluations, omit_jacobian_entry ? 2 : 3);
+        EXPECT_EQ(result.jacobian_evaluations, 2);
+    }
+}
+
 TEST(EqualityConstraints, InvalidatePreviousRankWhenANewJacobianEvaluationFails) {
     for (bool nonfinite_output : {false, true}) {
         auto problem = ScalarAffine(1.0);
@@ -387,6 +422,101 @@ TEST(ImplicitConstraints, NormalizeRowsAndDependentCoordinateUnits) {
     EXPECT_EQ(DifferentiateImplicitly(a, Eigen::MatrixXd::Zero(1, 1)).status, Status::InvalidInput);
     a(0, 0) = std::numeric_limits<double>::infinity();
     EXPECT_EQ(DifferentiateImplicitly(a, Eigen::Vector2d::Zero()).status, Status::InvalidInput);
+}
+
+TEST(ConstraintsScaling, PreserveRepresentableCombinedRowAndColumnScales) {
+    for (int direction : {-1, 1}) {
+        SCOPED_TRACE(direction);
+        const Eigen::MatrixXd a = Eigen::MatrixXd::Constant(1, 1, std::ldexp(1.0, 900 * direction));
+        const Eigen::VectorXd rhs = Eigen::VectorXd::Constant(1, std::ldexp(1.0, 400 * direction));
+        const double row_scale = std::ldexp(1.0, -500 * direction);
+        const double column_scale = std::ldexp(1.0, -700 * direction);
+        const double expected = std::ldexp(1.0, -500 * direction);
+
+        SolveOptions solve_options;
+        solve_options.residual_scales = Eigen::VectorXd::Constant(1, row_scale);
+        solve_options.variable_scales = Eigen::VectorXd::Constant(1, column_scale);
+        solve_options.residual_tolerance = std::ldexp(1.0, -950);
+        solve_options.damping = 0.0;
+        const auto solved = SolveEqualities(AffineProblem(a, rhs), Eigen::VectorXd::Zero(1), solve_options);
+        ASSERT_TRUE(solved.success()) << solved.message;
+        EXPECT_EQ(solved.x(0), expected);
+        EXPECT_TRUE(solved.full_column_rank);
+
+        DerivativeOptions derivative_options;
+        derivative_options.equation_scales = solve_options.residual_scales;
+        derivative_options.variable_scales = solve_options.variable_scales;
+        const auto differentiated = DifferentiateImplicitly(a, rhs, derivative_options);
+        ASSERT_TRUE(differentiated.success()) << differentiated.message;
+        EXPECT_EQ(differentiated.derivative(0, 0), -expected);
+        EXPECT_EQ(differentiated.relative_residual, 0.0);
+    }
+}
+
+TEST(ConstraintsScaling, SolveSubnormalJacobianWithDampedAndUndampedSteps) {
+    const double scale = std::ldexp(1.0, -1030);
+    const Eigen::MatrixXd jacobian = Eigen::MatrixXd::Constant(1, 1, scale);
+    const Eigen::VectorXd rhs = Eigen::VectorXd::Constant(1, scale);
+    const auto problem = AffineProblem(jacobian, rhs);
+
+    SolveOptions options;
+    options.damping = 0.0;
+    options.residual_tolerance = std::numeric_limits<double>::denorm_min();
+    const auto undamped = SolveEqualities(problem, Eigen::VectorXd::Zero(1), options);
+    ASSERT_TRUE(undamped.success()) << undamped.message;
+    EXPECT_EQ(undamped.rank, 1);
+    EXPECT_EQ(undamped.x(0), 1.0);
+
+    options.damping = scale;
+    options.max_iterations = 1;
+    const auto damped = SolveEqualities(problem, Eigen::VectorXd::Zero(1), options);
+    EXPECT_EQ(damped.status, Status::MaxIterations);
+    EXPECT_EQ(damped.rank, 1);
+    EXPECT_EQ(damped.x(0), 0.5);
+    EXPECT_EQ(damped.scaled_residual_norm, 0.5 * scale);
+}
+
+TEST(ConstraintsScaling, PreserveSubnormalResidualDirectionsThroughTheSvdProjection) {
+    const double tiny = std::numeric_limits<double>::denorm_min();
+    Eigen::Matrix2d jacobian;
+    jacobian << tiny, tiny, 0.0, tiny;
+    const Eigen::Vector2d expected(2.0, 2.0);
+    SolveOptions options;
+    options.damping = 0.0;
+    options.max_iterations = 1;
+    options.residual_tolerance = tiny;
+
+    const auto result = SolveEqualities(AffineProblem(jacobian, jacobian * expected), Eigen::Vector2d::Zero(), options);
+    ASSERT_TRUE(result.success()) << result.message;
+    EXPECT_EQ(result.rank, 2);
+    EXPECT_TRUE(result.x.isApprox(expected, 1e-13));
+}
+
+TEST(ConstraintsScaling, RetainRelativeRankAndConsistencyForSubnormalImplicitSystems) {
+    const double scale = std::ldexp(1.0, -1030);
+    Eigen::MatrixXd a(3, 2);
+    a << 2.0, 1.0, 1.0, 3.0, 0.0, 2.0;
+    a *= scale;
+    Eigen::Matrix2d expected;
+    expected << 1.0, -2.0, 3.0, 1.0;
+    Eigen::MatrixXd rhs = -a * expected;
+
+    const auto consistent = DifferentiateImplicitly(a, rhs);
+    ASSERT_TRUE(consistent.success()) << consistent.message;
+    EXPECT_EQ(consistent.rank, 2);
+    EXPECT_TRUE(consistent.derivative.isApprox(expected, 1e-13));
+
+    rhs(2, 0) += scale;
+    const auto inconsistent = DifferentiateImplicitly(a, rhs);
+    EXPECT_EQ(inconsistent.status, Status::Inconsistent);
+    EXPECT_EQ(inconsistent.rank, 2);
+    EXPECT_GT(inconsistent.relative_residual, 0.01);
+    EXPECT_GT(inconsistent.scaled_residual_norm, 0.0);
+
+    a.col(1) = a.col(0);
+    const auto singular = DifferentiateImplicitly(a, rhs);
+    EXPECT_EQ(singular.status, Status::RankDeficient);
+    EXPECT_EQ(singular.rank, 1);
 }
 
 }  // namespace

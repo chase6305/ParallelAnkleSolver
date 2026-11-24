@@ -86,6 +86,40 @@ TEST(RotaryRod, RetainFullCircleRootsBeyondPrincipalAsin) {
     }
 }
 
+TEST(RotaryRod, PreserveBothBranchesAcrossThePhaseCut) {
+    RotaryRodParams params;
+    params.rod_length = 0.125;
+    const Eigen::Vector3d point = -Eigen::Vector3d::UnitX();
+    const double opening = 2.0 * std::asin(params.rod_length / 2.0);
+    for (int motor_sign : {-1, 1}) {
+        params.motor_sign = motor_sign;
+        for (double offset : {-0.25, 0.0, 0.25}) {
+            params.motor_offset_rad = offset;
+            const auto result = SolveRotaryRod(params, point);
+            ASSERT_EQ(result.status, TransmissionStatus::Success);
+            ASSERT_EQ(result.count, 2U);
+            EXPECT_NEAR(result.solutions[0].crank_phase_rad, -kPi + opening, 1e-14);
+            EXPECT_NEAR(result.solutions[1].crank_phase_rad, kPi - opening, 1e-14);
+            EXPECT_EQ(result.solutions[0].branch, -1);
+            EXPECT_EQ(result.solutions[1].branch, 1);
+            for (std::size_t index = 0; index < result.count; ++index) {
+                const auto& solution = result.solutions[index];
+                const double expected_motor = std::remainder(motor_sign * solution.crank_phase_rad + offset,
+                                                             2.0 * kPi);
+                EXPECT_NEAR(solution.motor_phase_rad, expected_motor, 1e-14);
+                EXPECT_TRUE(solution.derivative_valid);
+                CheckRod(params, point, solution);
+            }
+        }
+    }
+
+    const auto tangent = SolveRotaryRod(RotaryRodParams{}, {-2.0, 0.0, 0.0});
+    ASSERT_EQ(tangent.status, TransmissionStatus::Tangent);
+    ASSERT_EQ(tangent.count, 1U);
+    EXPECT_EQ(tangent.solutions[0].crank_phase_rad, -kPi);
+    EXPECT_EQ(tangent.solutions[0].motor_phase_rad, -kPi);
+}
+
 TEST(RotaryRod, SupportArbitraryFixedAxisAndOutOfPlanePoints) {
     RotaryRodParams params;
     params.pivot = {2.0, -1.0, 3.0};

@@ -12,6 +12,7 @@
 #include <system_error>
 
 #include "parallel_ankle/parallel_ankle.h"
+#include "parallel_ankle/second_order.h"
 
 namespace {
 
@@ -22,7 +23,12 @@ constexpr unsigned kMaximumIterations = 100000;
 constexpr double kDifferenceStep = 1e-6;
 constexpr double kMaximumFrobeniusError = 1e-4;
 
-using Poses = std::array<Eigen::Vector2d, kPoseCount>;
+struct PoseSample {
+    Eigen::Vector2d task;
+    Eigen::Vector2d motor = Eigen::Vector2d::Zero();
+};
+
+using Poses = std::array<PoseSample, kPoseCount>;
 using Samples = std::array<double, kRepetitions>;
 
 // Every timed result contributes to an observable value, consumed after timing.
@@ -52,7 +58,7 @@ Poses MakePoses() {
     Poses poses;
     for (std::size_t pitch_index = 0; pitch_index < 8; ++pitch_index) {
         for (std::size_t roll_index = 0; roll_index < 8; ++roll_index) {
-            poses[8 * pitch_index + roll_index] = {
+            poses[8 * pitch_index + roll_index].task = {
                 -0.2 + 0.5 * static_cast<double>(pitch_index) / 7.0,
                 -0.1 + 0.2 * static_cast<double>(roll_index) / 7.0};
         }
@@ -60,13 +66,15 @@ Poses MakePoses() {
     return poses;
 }
 
-double ValidatePoses(const parallel_ankle::PMAnkle& ankle, const Poses& poses) {
+double ValidatePoses(const parallel_ankle::PMAnkle& ankle, Poses& poses) {
     double maximum_error = 0.0;
     for (std::size_t index = 0; index < poses.size(); ++index) {
-        const auto& pose = poses[index];
-        if (!ankle.GetAnkleMotorAngles(pose(0), pose(1)).success()) {
+        const auto& pose = poses[index].task;
+        const auto inverse = ankle.GetAnkleMotorAngles(pose(0), pose(1));
+        if (!inverse.success()) {
             throw std::runtime_error("invalid IK at benchmark pose " + std::to_string(index));
         }
+        poses[index].motor = inverse.motor_angles();
         const Eigen::Matrix2d analytic = ankle.ComputeJacobian(pose(0), pose(1));
         const Eigen::Matrix2d numerical = ankle.ComputeNumericalJacobian(pose(0), pose(1), kDifferenceStep);
         if (!analytic.allFinite() || !numerical.allFinite()) {
@@ -82,23 +90,21 @@ double ValidatePoses(const parallel_ankle::PMAnkle& ankle, const Poses& poses) {
     return maximum_error;
 }
 
-template <bool Analytic>
-double Measure(const parallel_ankle::PMAnkle& ankle, const Poses& poses, unsigned iterations) {
+double MatrixChecksum(const Eigen::Matrix2d& matrix) {
+    return matrix(0, 0) + 0.5 * matrix(0, 1) + 0.25 * matrix(1, 0) + 0.125 * matrix(1, 1);
+}
+
+template <typename Evaluate>
+double Measure(const Poses& poses, unsigned iterations, const Evaluate& evaluate) {
     double checksum = 0.0;
     const auto begin = std::chrono::steady_clock::now();
     for (unsigned iteration = 0; iteration < iterations; ++iteration) {
-        const auto& pose = poses[iteration % poses.size()];
+        const auto& sample = poses[iteration % poses.size()];
         // Volatile input reads prevent constant-pose folding under aggressive
         // whole-program optimization. Both methods include this same overhead.
-        volatile double pitch = pose(0);
-        volatile double roll = pose(1);
-        Eigen::Matrix2d jacobian;
-        if constexpr (Analytic) {
-            jacobian = ankle.ComputeJacobian(pitch, roll);
-        } else {
-            jacobian = ankle.ComputeNumericalJacobian(pitch, roll, kDifferenceStep);
-        }
-        checksum += jacobian(0, 0) + 0.5 * jacobian(0, 1) + 0.25 * jacobian(1, 0) + 0.125 * jacobian(1, 1);
+        volatile double pitch = sample.task(0);
+        volatile double roll = sample.task(1);
+        checksum += evaluate(pitch, roll, sample.motor);
     }
     const auto end = std::chrono::steady_clock::now();
     if (!std::isfinite(checksum)) {
@@ -134,10 +140,63 @@ void PrintSummary(const char* name, const Summary& summary) {
               << summary.maximum << '\n';
 }
 
+parallel_ankle::ForwardOptions NearbyInitialGuess(double pitch, double roll) {
+    parallel_ankle::ForwardOptions options;
+    options.initial_guess = {pitch + 0.02, roll - 0.01};
+    return options;
+}
+
+void ValidateKinematics(const parallel_ankle::PMAnkle& ankle, const Poses& poses) {
+    for (const auto& sample : poses) {
+        const auto nearby = NearbyInitialGuess(sample.task(0), sample.task(1));
+        for (const auto& options : {parallel_ankle::ForwardOptions{}, nearby}) {
+            const auto forward = ankle.SolveForwardKinematics(sample.motor(0), sample.motor(1), options);
+            if (!forward.success() || (forward.pose - sample.task).norm() > 2e-8) {
+                throw std::runtime_error("forward round trip failed at a benchmark pose");
+            }
+        }
+        const auto hessians = parallel_ankle::ComputeMotorAngleHessians(ankle, sample.task(0), sample.task(1));
+        if (!hessians[0].allFinite() || !hessians[1].allFinite()) {
+            throw std::runtime_error("nonfinite Hessian at a benchmark pose");
+        }
+    }
+}
+
+template <typename Evaluate>
+void MeasureSeries(const char* name, const Poses& poses, unsigned iterations, const Evaluate& evaluate) {
+    Samples samples;
+    for (double& measurement : samples) {
+        measurement = Measure(poses, iterations, evaluate);
+    }
+    PrintSummary(name, Summarize(samples));
+}
+
+void MeasureKinematics(const parallel_ankle::PMAnkle& ankle, const Poses& poses, unsigned iterations) {
+    MeasureSeries("inverse", poses, iterations, [&ankle](double pitch, double roll, const Eigen::Vector2d&) {
+        const auto inverse = ankle.GetAnkleMotorAngles(pitch, roll);
+        return inverse.theta_1_rad + 0.5 * inverse.theta_2_rad;
+    });
+    MeasureSeries("forward (zero initial guess)", poses, iterations,
+                  [&ankle](double, double, const Eigen::Vector2d& motor) {
+                      const auto forward = ankle.SolveForwardKinematics(motor(0), motor(1));
+                      return forward.pose(0) + 0.5 * forward.pose(1);
+                  });
+    MeasureSeries("forward (nearby initial guess)", poses, iterations,
+                  [&ankle](double pitch, double roll, const Eigen::Vector2d& motor) {
+                      const auto forward = ankle.SolveForwardKinematics(motor(0), motor(1), NearbyInitialGuess(pitch, roll));
+                      return forward.pose(0) + 0.5 * forward.pose(1);
+                  });
+    MeasureSeries("Hessians", poses, iterations, [&ankle](double pitch, double roll, const Eigen::Vector2d&) {
+        const auto hessians = parallel_ankle::ComputeMotorAngleHessians(ankle, pitch, roll);
+        return MatrixChecksum(hessians[0]) + 0.5 * MatrixChecksum(hessians[1]);
+    });
+}
+
 void PrintUsage(const char* executable) {
-    std::cout << "usage: " << executable << " [iterations]\n"
+    std::cout << "usage: " << executable << " [iterations] [--kinematics]\n"
               << "default iterations per method/repetition: " << kDefaultIterations << ", maximum: "
-              << kMaximumIterations << '\n';
+              << kMaximumIterations << '\n'
+              << "--kinematics also measures inverse/forward kinematics and Hessians\n";
 }
 
 }  // namespace
@@ -147,14 +206,20 @@ int main(int argc, char** argv) {
         PrintUsage(argv[0]);
         return 0;
     }
-    if (argc > 2) {
-        PrintUsage(argv[0]);
-        return 2;
-    }
     unsigned iterations = kDefaultIterations;
+    bool with_kinematics = false;
+    bool iterations_set = false;
     try {
-        if (argc == 2) {
-            iterations = ParseIterations(argv[1]);
+        for (int index = 1; index < argc; ++index) {
+            const std::string_view argument = argv[index];
+            if (argument == "--kinematics" && !with_kinematics) {
+                with_kinematics = true;
+            } else if (!iterations_set) {
+                iterations = ParseIterations(argument);
+                iterations_set = true;
+            } else {
+                throw std::invalid_argument("unexpected argument: " + std::string(argument));
+            }
         }
     } catch (const std::invalid_argument& error) {
         std::cerr << error.what() << '\n';
@@ -163,18 +228,27 @@ int main(int argc, char** argv) {
 
     try {
         const parallel_ankle::PMAnkle ankle(true, LegacyLeftParams());
-        const Poses poses = MakePoses();
+        Poses poses = MakePoses();
         // Validate all 64 poses and warm both methods before starting timers.
         const double maximum_error = ValidatePoses(ankle, poses);
+        if (with_kinematics) {
+            ValidateKinematics(ankle, poses);
+        }
+        const auto analytic_method = [&ankle](double pitch, double roll, const Eigen::Vector2d&) {
+            return MatrixChecksum(ankle.ComputeJacobian(pitch, roll));
+        };
+        const auto numerical_method = [&ankle](double pitch, double roll, const Eigen::Vector2d&) {
+            return MatrixChecksum(ankle.ComputeNumericalJacobian(pitch, roll, kDifferenceStep));
+        };
         Samples analytic_samples{};
         Samples numerical_samples{};
         for (std::size_t repetition = 0; repetition < kRepetitions; ++repetition) {
             if (repetition % 2 == 0) {
-                analytic_samples[repetition] = Measure<true>(ankle, poses, iterations);
-                numerical_samples[repetition] = Measure<false>(ankle, poses, iterations);
+                analytic_samples[repetition] = Measure(poses, iterations, analytic_method);
+                numerical_samples[repetition] = Measure(poses, iterations, numerical_method);
             } else {
-                numerical_samples[repetition] = Measure<false>(ankle, poses, iterations);
-                analytic_samples[repetition] = Measure<true>(ankle, poses, iterations);
+                numerical_samples[repetition] = Measure(poses, iterations, numerical_method);
+                analytic_samples[repetition] = Measure(poses, iterations, analytic_method);
             }
         }
 
@@ -191,6 +265,9 @@ int main(int argc, char** argv) {
         PrintSummary("numerical", numerical);
         if (analytic.median > 0.0) {
             std::cout << "measured numerical/analytic median ratio: " << numerical.median / analytic.median << '\n';
+        }
+        if (with_kinematics) {
+            MeasureKinematics(ankle, poses, iterations);
         }
         std::cout << "consumed checksum: " << result_sink << '\n';
     } catch (const std::exception& error) {
