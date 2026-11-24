@@ -1,0 +1,36 @@
+# Geometry fixture for regression tests. Lengths are in mm, angles in rad.
+robot_type: rotary
+version: reference
+
+rotary_reference:
+  ankle_params:
+    left:
+      r_roll_center: [0.0, 0.0, 0.0]
+      r_pitch_center: [0.0, 0.0, 10.0]
+      is_left_motor1: true
+      r_a1: [-46.0, 0.0, 257.94]
+      r_c1: [-46.0, -59.0, 0.0]
+      l_bar1: 60.0
+      l_rod1: 268.354
+      alpha_1_rad: 0.1745
+      is_left_motor2: false
+      r_a2: [-46.0, 0.0, 177.94]
+      r_c2: [-46.0, 59.0, 0.0]
+      l_bar2: 60.0
+      l_rod2: 188.355
+      alpha_2_rad: -0.1745
+    right:
+      r_roll_center: [0.0, 0.0, 0.0]
+      r_pitch_center: [0.0, 0.0, 10.0]
+      is_left_motor1: false
+      r_a1: [-46.0, 0.0, 257.94]
+      r_c1: [-46.0, 59.0, 0.0]
+      l_bar1: 60.0
+      l_rod1: 268.354
+      alpha_1_rad: -0.1745
+      is_left_motor2: true
+      r_a2: [-46.0, 0.0, 177.94]
+      r_c2: [-46.0, -59.0, 0.0]
+      l_bar2: 60.0
+      l_rod2: 188.355
+      alpha_2_rad: 0.1745

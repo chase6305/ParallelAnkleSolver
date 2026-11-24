@@ -1,0 +1,54 @@
+@PACKAGE_INIT@
+
+# Older dependency configs (including Eigen3) overwrite PACKAGE_PREFIX_DIR.
+# Resolve our installed data path before loading them.
+set(_ParallelAnkle_package_prefix "${PACKAGE_PREFIX_DIR}")
+set_and_check(ParallelAnkle_CONFIG_DIR "@PACKAGE_CMAKE_INSTALL_DATADIR@/ParallelAnkle/configs")
+
+include(CMakeFindDependencyMacro)
+find_dependency(Eigen3 3.3 NO_MODULE)
+include("${CMAKE_CURRENT_LIST_DIR}/ParallelAnkleCoreTargets.cmake")
+set(ParallelAnkle_FOUND TRUE)
+unset(ParallelAnkle_NOT_FOUND_MESSAGE)
+set(ParallelAnkle_core_FOUND TRUE)
+set(ParallelAnkle_config_FOUND FALSE)
+
+# An explicit core component never discovers yaml-cpp, even when this package
+# was built with the optional loader. No components preserves the full package.
+set(_ParallelAnkle_load_config FALSE)
+if(NOT ParallelAnkle_FIND_COMPONENTS)
+    if(@PARALLEL_ANKLE_WITH_YAML@)
+        set(_ParallelAnkle_load_config TRUE)
+    endif()
+elseif("config" IN_LIST ParallelAnkle_FIND_COMPONENTS)
+    set(_ParallelAnkle_load_config TRUE)
+endif()
+
+foreach(_ParallelAnkle_component IN LISTS ParallelAnkle_FIND_COMPONENTS)
+    if(NOT _ParallelAnkle_component STREQUAL "core" AND NOT _ParallelAnkle_component STREQUAL "config")
+        set(ParallelAnkle_${_ParallelAnkle_component}_FOUND FALSE)
+        set(ParallelAnkle_NOT_FOUND_MESSAGE "Unsupported ParallelAnkle component: ${_ParallelAnkle_component}")
+    endif()
+endforeach()
+
+if(_ParallelAnkle_load_config)
+    if(@PARALLEL_ANKLE_WITH_YAML@)
+        if(NOT ParallelAnkle_FIND_COMPONENTS OR ParallelAnkle_FIND_REQUIRED_config)
+            find_dependency(yaml-cpp)
+        else()
+            find_package(yaml-cpp QUIET)
+        endif()
+        if(yaml-cpp_FOUND)
+            include("${CMAKE_CURRENT_LIST_DIR}/ParallelAnkleConfigTargets.cmake")
+            set(ParallelAnkle_config_FOUND TRUE)
+        endif()
+    else()
+        set(ParallelAnkle_NOT_FOUND_MESSAGE "ParallelAnkle was built without the config component")
+    endif()
+endif()
+
+check_required_components(ParallelAnkle)
+set(PACKAGE_PREFIX_DIR "${_ParallelAnkle_package_prefix}")
+unset(_ParallelAnkle_package_prefix)
+unset(_ParallelAnkle_component)
+unset(_ParallelAnkle_load_config)
