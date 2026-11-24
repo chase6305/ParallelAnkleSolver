@@ -1,40 +1,60 @@
 # ParallelAnkleSolver
 
-双足机器人并联脚踝与腿部闭环机构求解库。旋转驱动脚踝由两路电机驱动曲柄和定长连杆，任务自由度为 **pitch / roll**。
+**English** · [简体中文](README.zh-CN.md)
 
-核心使用 **C++17 + Eigen3**，可单独编译；YAML 配置加载器为可选组件。
+Kinematics for parallel ankles and closed-loop leg mechanisms in bipedal robots. The core is a standalone C++17 library built on Eigen3. YAML configuration support is optional.
 
-## 已有功能
+## Mechanism configurations
 
-- 解析逆运动学：脚踝姿态 → 两个电机角度。
-- 数值正运动学：电机角度 → 脚踝姿态，支持初值、迭代上限和收敛状态。
-- 闭环约束的解析雅可比、独立数值差分参考，以及电机/任务空间的速度、力矩转换。
-- 任务空间刚度、阻尼到完整电机矩阵的转换，保留交叉耦合项。
-- 可选的 电机角 Hessian 与带静态预载的完整刚度矩阵映射。
-- 独立的 pitch / roll 旋转中心，以及左右脚、电机方向和零位偏移配置。
-- 两组旋转脚踝示例参数及独立测试参数的回归验证。
-- 一般平面五杆的多分支 FK/IK、A/B 约束雅可比与奇异性诊断。
-- 任意固定轴曲柄—连杆的完整圆周相位分支，以及带行程限制的直线长度原语。
-- 欧氏等式约束的带阻尼局部求解、变量/残差尺度与相容性受检的隐式微分。
+### Dual rotary-drive ankle
 
-## 快速开始
+![Dual rotary-drive ankle. Two fixed motors connect to the footplate through cranks and fixed-length rods. The inset shows the separate pitch and roll centers.](docs/figures/rotary-ankle.png)
 
-依赖：CMake ≥ 3.16、C++17 编译器、Eigen3；默认构建还使用 yaml-cpp 和 GoogleTest。对应 Ubuntu 软件包为 `libeigen3-dev`、`libyaml-cpp-dev`、`libgtest-dev`。构建过程不下载依赖。
+Motors at `A₁` and `A₂` drive cranks `AᵢBᵢ`. The fixed-length rods `BᵢCᵢ` transmit their motion to the footplate. The inset shows the pitch center `O_p` and roll center `O_r` at the neutral pose of `rotary_reference`. `PMAnkle` uses `[pitch, roll]` and the rotation product `Ry(pitch) Rx(roll)`. [Crank and rod geometry](docs/model.md)
 
-验证脚本另需 Python3、`flock`（util-linux）、`free/uptime/ps`（procps）与 `rg`（ripgrep）。在仓库根目录运行。
+### Planar five-bar
+
+![Planar five-bar. Two driven links extend from a fixed base to elbow joints. The distal links meet at the foot point, with dashed lines showing a second possible intersection.](docs/figures/planar-five-bar.png)
+
+The fixed base `A₁A₂`, two driven links, and two distal links form the closed loop. Motor angles `θ₁` and `θ₂` locate elbows `E₁` and `E₂`. The distal links can meet at `P` or `P′`, giving two assembly modes for the same motor angles. `PlanarFiveBar` uses the planar foot position `[x, y]` as its task coordinate. The schematic is based on the asymmetric `five_bar_demo` example. [Five-bar coordinates and branches](docs/backends.md#一般平面五杆)
+
+### Dual linear-drive spatial ankle
+
+![Dual linear-drive spatial ankle. Each leg has a base universal joint, a telescoping actuator, and a footplate ball joint. The two axes of the central universal joint intersect at O.](docs/figures/linear-universal-ankle.png)
+
+From base to footplate, each leg runs through a universal joint `Uᵢ`, a prismatic actuator `Pᵢ`, and a spherical joint `Sᵢ`. The actuators control leg lengths `ℓ₁` and `ℓ₂`. The central universal joint constrains the footplate to two-axis rotation about `O`. The example uses `[roll, pitch]` and `Rx(roll) Ry(pitch)`. [Spatial ankle example](docs/research/linear_universal_ankle.md)
+
+## Features
+
+- Analytical inverse kinematics for the rotary ankle, from foot pose to both motor angles.
+- Numerical forward kinematics with a configurable initial guess, iteration cap, and convergence status.
+- An analytical closure Jacobian, an independent finite-difference reference, and velocity and torque mappings between task and motor coordinates.
+- Full motor stiffness and damping matrices that retain cross-axis coupling.
+- Optional motor-angle Hessians and a static loaded stiffness mapping.
+- Separate pitch and roll centers, with configurable foot geometry, motor directions, and zero offsets.
+- Regression tests for both rotary ankle examples and a separate reference geometry.
+- Multi-branch five-bar FK and IK, its A/B constraint Jacobians, and singularity diagnostics.
+- Full-circle fixed-axis crank phases and prismatic lengths with stroke limits.
+- Damped local solves for Euclidean equality constraints, with variable and residual scaling and consistency-checked implicit differentiation.
+
+## Quick start
+
+The core requires CMake 3.16 or later, a C++17 compiler, and Eigen3. The default build also uses yaml-cpp and GoogleTest. On Ubuntu, the corresponding packages are `libeigen3-dev`, `libyaml-cpp-dev`, and `libgtest-dev`. The build uses locally installed dependencies.
+
+The verification scripts require Python 3, `flock` from util-linux, `free`, `uptime`, and `ps` from procps, and `rg` from ripgrep. Run this command from the repository root.
 
 ```bash
 ./scripts/check.sh
 ```
 
-脚本持有跨对话排他锁，检查内存与负载，以最多 2 个编译 worker 构建，串行执行测试，然后运行三组配置的示例。资源忙时以状态码 75 返回，表示推迟执行。
+The script acquires the shared resource lock, checks available memory and load, builds with at most two workers, runs tests serially, and exercises three configuration examples. It returns status 75 when resources are busy.
 
-需要等待锁时可设置 `PARALLEL_ANKLE_LOCK_WAIT_SECONDS=60`（默认不等待，最大 3600 秒）。锁等待期间不运行编译或测试。
+Set `PARALLEL_ANKLE_LOCK_WAIT_SECONDS=60` to wait for the lock. The default is zero seconds and the maximum is 3600. Builds and tests start after lock acquisition.
 
-单独运行示例：
+Run individual examples from the repository root.
 
 ```bash
-./build/ankle_demo configs/rotary_ankle.yaml          # 默认 rotary_v02
+./build/ankle_demo configs/rotary_ankle.yaml          # Defaults to rotary_v02
 ./build/ankle_demo configs/rotary_ankle.yaml rotary_v01
 ./build/ankle_demo configs/rotary_ankle_reference.yaml
 ./build/five_bar_demo
@@ -44,23 +64,23 @@
 ./build/linear_universal_ankle_demo
 ```
 
-脚踝示例对左右脚分别执行 IK → FK，并输出电机角度、还原姿态、残差和雅可比。其他示例演示五杆分支、局部闭环约束、旋转/直线支链和静态预载映射。`linear_universal_ankle_demo` 组合现有接口，演示两条长度执行器与中心万向节的空间脚踝。后端坐标、单位及局部求解范围见 [backends.md](docs/backends.md)。
+The ankle demo runs IK followed by FK for each foot and prints the motor angles, recovered pose, residual, and Jacobian. The other examples cover five-bar branches, local closure constraints, rotary and prismatic legs, and static preload. `linear_universal_ankle_demo` combines the library primitives to model two linear actuators and a central universal joint. [Backend coordinate conventions and solver scope](docs/backends.md)
 
-## 后端选择
+## Choosing a backend
 
-| 后端 | 输入/任务坐标 | 解的范围 |
+| Backend | Input or task coordinate | Solution scope |
 | --- | --- | --- |
-| `PMAnkle` | pitch/roll 角 | 固定分支 IK、局部 FK |
-| `PlanarFiveBar` | 足端二维位置或两电机角 | 最多 4 组 IK / 2 组 FK，显式分支 |
-| `SolveRotaryRod` | 三维连接点 | 任意固定轴、最多 2 个模 2π 相位族 |
-| `SolvePrismaticLength` | 三维连接点 | 支链长度、行程和方向梯度 |
-| `SolveEqualities` | 用户的闭环方程与初值 | 局部欧氏约束解、边界与秩诊断 |
+| `PMAnkle` | Pitch and roll angles | Fixed-branch IK and local FK |
+| `PlanarFiveBar` | Planar foot point or two motor angles | Up to 4 IK solutions and 2 FK solutions with explicit branches |
+| `SolveRotaryRod` | 3D attachment point | Arbitrary fixed axis and up to 2 phase families modulo 2π |
+| `SolvePrismaticLength` | 3D attachment point | Leg length, stroke check, and direction gradient |
+| `SolveEqualities` | User-supplied equations and initial state | Local Euclidean constraint solve with bounds and rank diagnostics |
 
-各模型的完整坐标与单位约定见 [backends.md](docs/backends.md)。安装/嵌入消费与可选短时基准入口为 `./scripts/check_all.sh --benchmark`；GCC/Clang 的地址/未定义行为检查入口为 `./scripts/check_sanitizers.sh`。这些脚本都使用相同共享锁。
+`./scripts/check_all.sh --benchmark` exercises installed and embedded consumers and runs a short benchmark. `./scripts/check_sanitizers.sh` runs address and undefined-behavior checks with GCC or Clang. Both scripts use the shared resource lock. [Coordinates and units for each backend](docs/backends.md)
 
-资源锁的轻量协议检查为 `./scripts/check_lock_protocol.sh`，仅使用独立临时锁验证继承和退出释放，不执行编译或数值计算；它不替代实际资源余量检查。
+`./scripts/check_lock_protocol.sh` uses a separate temporary lock to check descriptor inheritance and lock release on exit. The resource-aware build scripts perform the host headroom checks.
 
-## 在 C++ 中使用
+## Using the library in C++
 
 ```cpp
 #include <stdexcept>
@@ -75,7 +95,7 @@ if (!ik.success()) {
 }
 
 parallel_ankle::ForwardOptions options;
-options.initial_guess = {0.0, 0.0};  // 连续反馈可使用上一帧姿态
+options.initial_guess = {0.0, 0.0};  // Use the previous pose for continuous feedback.
 const auto fk = left_ankle.SolveForwardKinematics(ik.theta_1_rad, ik.theta_2_rad, options);
 if (!fk.success()) {
     throw std::runtime_error(parallel_ankle::ToString(fk.status));
@@ -83,7 +103,7 @@ if (!fk.success()) {
 // fk.pose = [pitch, roll]
 ```
 
-CMake 子项目可以使用：
+For a CMake subproject, link the optional configuration component as follows.
 
 ```cmake
 set(PARALLEL_ANKLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -92,51 +112,52 @@ add_subdirectory(path/to/ParallelAnkleSolver)
 target_link_libraries(your_target PRIVATE ParallelAnkle::config)
 ```
 
-直接用 `AnkleParams` 构造参数时，链接 `ParallelAnkle::core` 即可。设置 `PARALLEL_ANKLE_WITH_YAML=OFF` 可以完全去掉 yaml-cpp 依赖。也支持 `cmake --install build --prefix "$PWD/install"`。安装后使用 `find_package(ParallelAnkle CONFIG REQUIRED COMPONENTS core)` 时无需 yaml-cpp；需要加载器时请求 `COMPONENTS config`。安装配置路径为 `ParallelAnkle_CONFIG_DIR`。
+If you construct `AnkleParams` directly, link `ParallelAnkle::core`. Set `PARALLEL_ANKLE_WITH_YAML=OFF` for a core-only build. For an installed package, run `cmake --install build --prefix "$PWD/install"`. Request `find_package(ParallelAnkle CONFIG REQUIRED COMPONENTS core)` for the Eigen-only core or request the `config` component for YAML loading. `ParallelAnkle_CONFIG_DIR` points to the installed configuration files.
 
-作为 CMake 子项目时默认关闭示例和测试，不额外查找 GoogleTest。
+Subproject builds omit examples and tests by default. Enabling tests also enables GoogleTest discovery.
 
-## 参数与约定
+## Parameters and conventions
 
-| 配置 | 曲柄长度 | Roll / Pitch 中心 Z | 用途 |
+| Configuration | Crank length | Roll / pitch center Z | Use |
 | --- | --- | --- | --- |
-| `rotary_v02`（默认） | 30 mm | −15 / −5 mm | 当前示例几何 |
-| `rotary_v01` | 60 mm | 3 / 3 mm | 早期示例几何 |
-| `rotary_reference` | 60 mm | 0 / 10 mm | 回归测试几何 |
+| `rotary_v02` (default) | 30 mm | −15 / −5 mm | Current example geometry |
+| `rotary_v01` | 60 mm | 3 / 3 mm | Earlier example geometry |
+| `rotary_reference` | 60 mm | 0 / 10 mm | Regression test geometry |
 
-加载器读取所选 profile 的 `ankle_params`。默认 profile 来自 `robot_type + "_" + version`。
+The loader reads `ankle_params` from the selected profile. The default profile name is `robot_type + "_" + version`.
 
-旋转脚踝的所有角度为 rad，关节顺序固定为 `[pitch, roll]`，电机顺序为 `[motor1, motor2]`。示例几何参数使用 mm；同一模型的全部长度和坐标应使用同一单位。该角度到角度的闭环方程经过尺度归一化，统一缩放不改变角度和雅可比。其他后端分别定义任务坐标和雅可比单位，例如五杆为 `rad/长度`，线性驱动空间示例为 `长度/rad`，按各自模型说明使用。
+For the rotary ankle, angles are in radians. Task coordinates use `[pitch, roll]` and motor coordinates follow wiring order `[motor1, motor2]`. The sample geometries use millimeters. Keep all positions and lengths in one unit within a model. The rotary angle-to-angle closure is scale-normalized, so uniform length scaling preserves angles and the Jacobian. Other backends use their own units, such as `rad/length` for the five-bar and `length/rad` for the linear-drive ankle example.
 
-电机方向由 `is_left_motor1/2` 决定：为 `false` 时先对解析角取反，再加 `alpha_*_rad`。`PMAnkle` 的 `is_left` 只标记脚侧，不额外改变符号。左右脚需要各自提供参数。
+`is_left_motor1/2` determines each motor direction. When the flag is `false`, the solver negates the analytical crank angle before adding `alpha_*_rad`. `PMAnkle::is_left()` identifies the foot side. Supply each foot with its own parameters.
 
-## 求解结果与边界
+## Solver results and limits
 
-IK 不可达或输入非有限值时，对应 `success_*` 为 `false`，角度为 NaN。`status_1/2` 区分非法输入、不可达、曲柄角未定义、超出当前装配分支与数值表示失败。电机输出减去零偏后必须在 `1e-12 rad` 内恢复所选曲柄角，并继续满足杆长与选定工作根；有限零偏若抹去有效角度或切换到另一闭合根，也会返回失败。杆长复核按连杆自身长度计容差，短杆开角有稳定半角恢复路径。应检查两个执行器的状态。FK 返回收敛状态、稳定范数残差、迭代次数和姿态；失败时姿态仅为最后一次迭代值。兼容方法 `GetAnklePoseFromMotorAngles()` 在失败时抛出异常。
+For an unreachable pose or nonfinite input, the affected actuator returns a false `success_*` flag and a NaN angle. `status_1/2` identifies invalid input, unreachable closure, undefined crank angle, a result outside the selected branch, or a numerical representation failure. The decoded motor angle must recover the selected crank angle within `1e-12 rad` and satisfy rod closure on the selected working root. Closure tolerance is relative to the rod length. A stable half-angle path handles small openings with short rods. Check the status of both actuators.
 
-雅可比的定义为 `J = d(theta) / d([pitch, roll])`。`ComputeJacobian(pitch, roll)` 从杆长闭环直接求导；`ComputeNumericalJacobian(pitch, roll, eps)` 提供独立差分参考。原有显式三参数 `ComputeJacobian(pitch, roll, eps)` 仍调用数值版本。执行器传动奇异时解析导数报错；涉及逆映射的接口也会拒绝秩亏矩阵。原刚度/阻尼矩阵接口对应无预载下的局部线性化。
+FK returns the pose, convergence status, stable residual norm, and iteration count. On failure the pose is the final iterate. `GetAnklePoseFromMotorAngles()` throws when the forward solve fails.
 
-另行请求的 `second_order.h` 接口计算 电机角 Hessian 与静态预载几何刚度，接受完整对称任务矩阵，报告电机矩阵是否半正定。它不包含运动中 PD 控制的速度项；公式、符号和使用范围见[二阶映射说明](docs/research/second_order_transmission.md)。
+The Jacobian is `J = d(theta) / d([pitch, roll])`. `ComputeJacobian(pitch, roll)` differentiates the rod closure analytically. `ComputeNumericalJacobian(pitch, roll, eps)` is the independent finite-difference reference. The three-argument `ComputeJacobian(pitch, roll, eps)` overload calls that numerical version. The analytic derivative reports actuator transmission singularities. Inverse mapping interfaces require a full-rank Jacobian. The stiffness and damping matrix interfaces use the local unloaded linearization.
 
-旋转脚踝使用固定曲柄分支，检查正弦、余弦及杆长，拒绝 `asin` 折叠造成的伪解。曲柄物理侧由零位 `C.y - A.y` 的符号确定；该差为零的机构不在此模型支持范围。正解使用带回溯的局部 Newton 迭代。其他装配分支、全工作空间多解、电机/关节限位与碰撞约束尚未建模。现有测试验证给定配置中的有限采样点。
+The optional `second_order.h` API calculates motor-angle Hessians and geometric stiffness from static preload. It accepts a full symmetric task matrix and reports whether the motor stiffness is positive semidefinite. Its scope is static stiffness around the current pose. [Second-order mapping](docs/research/second_order_transmission.md)
 
-## 目录
+The rotary ankle solver uses a fixed crank branch and checks the sine, cosine, and rod length to resolve the branch. The sign of `C.y - A.y` at the neutral pose determines the crank side and must be nonzero. Forward kinematics uses local Newton iterations with backtracking. The model covers the selected assembly branch, with travel and collision limits outside the modeled geometry. The tests cover finite samples of the supplied geometries.
+
+## Repository layout
 
 ```text
-include/parallel_ankle/  公共参数、求解器、配置接口
-src/                    求解实现与可选 YAML 加载器
-configs/                旋转脚踝示例几何
-examples/               可运行示例
-tests/                  几何闭环、正逆解、映射与失败状态测试
-docs/                   模型说明和研究索引
-scripts/check.sh        遵守整机资源约定的构建与验证入口
+include/parallel_ankle/  Public parameters, solvers, and configuration interfaces
+src/                    Solver implementation and optional YAML loader
+configs/                Example rotary ankle geometries
+examples/               Runnable examples
+tests/                 Closure, IK/FK, mapping, and failure-state checks
+docs/                  Model documentation and research index
+scripts/check.sh        Resource-aware build and verification entry point
 ```
 
-模型公式见[机构模型](docs/model.md)。高精度导数核对见[雅可比收敛验证](tools/validation/JACOBIAN_CONVERGENCE.md)。
+See the mechanism derivation and the independent high-precision derivative check. [Mechanism model](docs/model.md) · [Jacobian convergence check](tools/validation/JACOBIAN_CONVERGENCE.md)
 
+## Parallel leg mechanism research
 
-## 腿部并联构型研究
+The research index covers planar five-bar legs, symmetric coaxial mechanisms, parallel ankles and knees, and mixed serial-parallel legs. It reviews HyRoDyn, the Gepetto toolbox, TriP, GRBDA, and RoboCompiler and records paper availability, software licenses, capabilities, and reproduction status. [Papers, implementations, and integration approaches](docs/research/README.md)
 
-已整理[论文、开源实现与适配路线](docs/research/README.md)，涵盖一般五杆腿、同轴对称并联腿、并联脚踝/膝和多闭环混合腿。重点核查 HyRoDyn、Gepetto 工具箱、TriP、GRBDA 与 RoboCompiler，并分别记录论文公开状态、代码许可证、实际能力和本仓库复现状态。
-
-原生后端已通过有限采样的几何、分支、导数与失败状态测试。Doggo 回归核对的是公开固件中的平面几何和虚拟腿雅可比，不能据此推断原始编码器、整机或其他机器人已完成硬件适配。外部框架尚未接入或复现。
+The native backends have finite-sample tests for geometry, branches, derivatives, and failure states. The Doggo regression covers planar geometry and the virtual-leg Jacobian from the public firmware. Hardware and encoder calibration require their own validation. The research index records the integration status of each external framework.
