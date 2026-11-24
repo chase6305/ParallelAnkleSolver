@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include "ankle_derivatives.h"
+#include "inverse_congruence.h"
 
 namespace parallel_ankle {
 namespace {
@@ -15,38 +16,6 @@ namespace {
 constexpr double kRankThreshold = 1e-10;
 constexpr double kSymmetryTolerance = 1e-12;
 constexpr double kSemidefiniteTolerance = 128.0 * std::numeric_limits<double>::epsilon();
-
-double FiniteMidpoint(double first, double second) {
-    if (first == second) {
-        return first;
-    }
-    constexpr double half_max = std::numeric_limits<double>::max() * 0.5;
-    constexpr double twice_min = std::numeric_limits<double>::min() * 2.0;
-    const double first_magnitude = std::abs(first);
-    const double second_magnitude = std::abs(second);
-    if (first_magnitude <= half_max && second_magnitude <= half_max) {
-        // Add before halving to preserve subnormal midpoints, including the
-        // ties-to-even midpoint of denorm_min and 2*denorm_min.
-        return (first + second) * 0.5;
-    }
-    if (first_magnitude < twice_min) {
-        return first + second * 0.5;
-    }
-    if (second_magnitude < twice_min) {
-        return first * 0.5 + second;
-    }
-    // Both halves are normal here. This also handles opposite large signs
-    // without overflowing either their sum or their difference.
-    return first * 0.5 + second * 0.5;
-}
-
-Eigen::Matrix2d SymmetricAverage(const Eigen::Matrix2d& matrix) {
-    Eigen::Matrix2d symmetric = matrix;
-    const double off_diagonal = FiniteMidpoint(matrix(0, 1), matrix(1, 0));
-    symmetric(0, 1) = off_diagonal;
-    symmetric(1, 0) = off_diagonal;
-    return symmetric;
-}
 
 Eigen::Matrix2d SymmetricInput(const Eigen::Matrix2d& matrix) {
     if (!matrix.allFinite()) {
@@ -62,7 +31,7 @@ Eigen::Matrix2d SymmetricInput(const Eigen::Matrix2d& matrix) {
     }
     // Normalization is only for the relative symmetry check. Reconstructing
     // from it would erase small representable entries in a mixed-scale input.
-    return SymmetricAverage(matrix);
+    return detail::SymmetricAverage(matrix);
 }
 
 bool PositiveSemidefinite(const Eigen::Matrix2d& matrix) {
@@ -108,26 +77,9 @@ LoadedStaticStiffnessResult MapLoadedStaticTaskStiffness(const PMAnkle& model,
     if (!inverse.allFinite() || !result.geometric_stiffness.allFinite() || !corrected.allFinite()) {
         throw std::overflow_error("loaded stiffness mapping produced nonfinite entries");
     }
-    // A small entry can underflow in the first double product and become
-    // representable again after the second factor. Keep the congruence in
-    // extended precision until both factors have been applied. This leaves
-    // the preload correction's existing double arithmetic contract intact.
-    using ExtendedMatrix = Eigen::Matrix<long double, 2, 2>;
-    const ExtendedMatrix extended_inverse = inverse.cast<long double>();
-    const ExtendedMatrix extended_corrected = corrected.cast<long double>();
-    const ExtendedMatrix extended_motor = extended_inverse.transpose() * extended_corrected * extended_inverse;
-    constexpr long double double_max = std::numeric_limits<double>::max();
-    Eigen::Matrix2d motor;
-    for (int row = 0; row < 2; ++row) {
-        for (int column = 0; column < 2; ++column) {
-            const long double value = extended_motor(row, column);
-            if (!std::isfinite(value) || std::abs(value) > double_max) {
-                throw std::overflow_error("loaded stiffness is not representable as a finite double matrix");
-            }
-            motor(row, column) = static_cast<double>(value);
-        }
+    if (!detail::TryTransformSymmetricGains(inverse, corrected, result.motor_stiffness)) {
+        throw std::overflow_error("loaded stiffness is not representable as a finite double matrix");
     }
-    result.motor_stiffness = SymmetricAverage(motor);
     result.task_positive_semidefinite = PositiveSemidefinite(task);
     result.motor_positive_semidefinite = PositiveSemidefinite(result.motor_stiffness);
     return result;

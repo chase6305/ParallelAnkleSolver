@@ -199,6 +199,30 @@ TEST(Mappings, PreserveGainEnergyAndCoupling) {
     EXPECT_THROW(ankle.GetTaskTorquesFromMotorTorques(0.0, 0.0, kNaN, 1.0), std::invalid_argument);
 }
 
+TEST(Mappings, PreserveSymmetricSubnormalGainAfterBothFactors) {
+    AnkleParams params;
+    params.r_c1 = {-4.0, -16.0, 0.0};
+    params.r_a1 = {-4.0, -17.0, 1.0};
+    params.r_c2 = {0.0, 1.0, 0.0};
+    params.r_a2 = {0.0, 0.0, 1.0};
+    params.l_bar1 = params.l_bar2 = params.l_rod1 = params.l_rod2 = 1.0;
+    params.is_left_motor1 = params.is_left_motor2 = true;
+    const PMAnkle ankle(true, params);
+    Eigen::Matrix2d jacobian;
+    jacobian << 4.0, -16.0, 0.0, 1.0;
+    ASSERT_EQ(ankle.ComputeJacobian(0.0, 0.0), jacobian);
+
+    // The first row of J^-1 is [1/4, 4]. Multiplying the gain by 1/4
+    // first would erase it before the factor of 4 restores its magnitude.
+    const double gain = std::numeric_limits<double>::denorm_min();
+    Eigen::Matrix2d expected;
+    expected << 0.0, gain, gain, 16.0 * gain;
+    EXPECT_EQ(ankle.GetMotorStiffnessMatrixFromTaskStiffness(0.0, 0.0, gain, 0.0), expected);
+    EXPECT_EQ(ankle.GetMotorDampingMatrixFromTaskDamping(0.0, 0.0, gain, 0.0), expected);
+    EXPECT_THROW(ankle.GetMotorStiffnessMatrixFromTaskStiffness(0.0, 0.0, std::numeric_limits<double>::max(), 0.0),
+                 std::overflow_error);
+}
+
 TEST(Mappings, RejectSingularInverseMappings) {
     auto params = LegacyParams(true);
     params.r_a2 = params.r_a1;

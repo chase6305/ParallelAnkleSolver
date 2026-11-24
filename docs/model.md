@@ -89,7 +89,7 @@ K_motor = J^(-T) K_task J^(-1)
 D_motor = J^(-T) D_task J^(-1)
 ```
 
-力矩关系满足 `tau_task · q_dot = tau_motor · theta_dot`。增益接口输入 pitch、roll 两个非负对角元素，返回完整的 2×2 电机矩阵。
+力矩关系满足 `tau_task · q_dot = tau_motor · theta_dot`。增益接口输入 pitch、roll 两个非负对角元素，返回完整的对称 2×2 电机矩阵。两个逆雅可比因子以扩展精度应用，最终矩阵再转换为 double，以保留中间乘积下溢时仍可表示的耦合项。
 
 刚度公式是无预载、局部微小位移下的线性映射，未包含姿态相关雅可比在预载下产生的额外刚度项。库保留交叉项，调用方需要按完整矩阵使用。
 

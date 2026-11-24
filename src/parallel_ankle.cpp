@@ -11,6 +11,7 @@
 
 #include "ankle_derivatives.h"
 #include "crank_geometry.h"
+#include "inverse_congruence.h"
 
 namespace parallel_ankle {
 namespace {
@@ -484,8 +485,9 @@ Eigen::Matrix2d PMAnkle::MapTaskGains(double q_pitch_rad, double q_roll_rad, dou
     }
     const Eigen::Matrix2d inverse = FactorJacobian(ComputeJacobian(q_pitch_rad, q_roll_rad))
                                         .solve(Eigen::Matrix2d::Identity());
-    const Eigen::Matrix2d result = inverse.transpose() * Eigen::Vector2d(pitch, roll).asDiagonal() * inverse;
-    if (!result.allFinite()) {
+    const Eigen::Matrix2d task = Eigen::Vector2d(pitch, roll).asDiagonal();
+    Eigen::Matrix2d result;
+    if (!detail::TryTransformSymmetricGains(inverse, task, result)) {
         throw std::overflow_error("ankle gain mapping produced a nonfinite result");
     }
     return result;
