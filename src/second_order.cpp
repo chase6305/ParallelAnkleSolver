@@ -1,133 +1,21 @@
 #include "parallel_ankle/second_order.h"
 
 #include <Eigen/Eigenvalues>
-#include <Eigen/Geometry>
 #include <Eigen/LU>
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 
-#include "crank_geometry.h"
+#include "ankle_derivatives.h"
+#include "inverse_congruence.h"
 
 namespace parallel_ankle {
 namespace {
 
 constexpr double kRankThreshold = 1e-10;
 constexpr double kSymmetryTolerance = 1e-12;
-constexpr double kDerivativeTolerance = 128.0 * std::numeric_limits<double>::epsilon();
-
-struct DerivativeEvaluation {
-    Eigen::Matrix2d jacobian;
-    std::array<Eigen::Matrix2d, 2> hessians;
-};
-
-DerivativeEvaluation EvaluateDerivatives(const PMAnkle& model, double pitch_rad, double roll_rad) {
-    if (!std::isfinite(pitch_rad) || !std::isfinite(roll_rad)) {
-        throw std::invalid_argument("second-order task angles must be finite");
-    }
-    const auto ik = model.GetAnkleMotorAngles(pitch_rad, roll_rad);
-    if (!ik.success()) {
-        throw std::domain_error("cannot differentiate outside the supported ankle IK branch");
-    }
-    DerivativeEvaluation evaluation;
-    evaluation.jacobian = model.ComputeJacobian(pitch_rad, roll_rad);
-    const auto& params = model.parameters();
-    const Eigen::Matrix3d pitch = Eigen::AngleAxisd(pitch_rad, Eigen::Vector3d::UnitY()).toRotationMatrix();
-    const Eigen::Matrix3d roll = Eigen::AngleAxisd(roll_rad, Eigen::Vector3d::UnitX()).toRotationMatrix();
-    for (int index = 0; index < 2; ++index) {
-        const Eigen::Vector3d& a = index == 0 ? params.r_a1 : params.r_a2;
-        const Eigen::Vector3d& c0 = index == 0 ? params.r_c1 : params.r_c2;
-        const double bar = index == 0 ? params.l_bar1 : params.l_bar2;
-        const double rod = index == 0 ? params.l_rod1 : params.l_rod2;
-        const double direction = (index == 0 ? params.is_left_motor1 : params.is_left_motor2) ? 1.0 : -1.0;
-        const double side = std::copysign(1.0, c0.y() - a.y());
-
-        const Eigen::Vector3d rolled = roll * (c0 - params.r_roll_center);
-        const Eigen::Vector3d pitch_relative = pitch * (rolled + (params.r_roll_center - params.r_pitch_center));
-        const Eigen::Vector3d delta = pitch_relative + (params.r_pitch_center - a);
-        const double scale = std::max({delta.cwiseAbs().maxCoeff(), bar, rod});
-        const double length = bar / scale;
-        const Eigen::Vector3d r = delta / scale;
-        // Differentiate the same ideal geometric curve as the core Jacobian.
-        // Decoding gamma from its rounded encoder angle can perturb the small
-        // transmission denominator near a fold, even when IK accepts the
-        // encoder's sub-picoradian representation error. Keep this selected
-        // shared geometric evaluation, including its short-rod fallback.
-        const auto phase = detail::SolveCrankPhase(delta, bar, rod, side);
-        if (phase.status != InverseStatus::Success) {
-            throw std::domain_error("ankle second derivative has no valid geometric crank angle");
-        }
-        const double gamma = phase.gamma;
-        const Eigen::Vector3d u(0.0, side * std::cos(gamma), std::sin(gamma));
-        const Eigen::Vector3d u_prime(0.0, -side * std::sin(gamma), std::cos(gamma));
-        const Eigen::Vector3d v = r - length * u;
-        const double denominator = length * r.dot(u_prime);
-        if (!std::isfinite(denominator) ||
-            std::abs(denominator) <= kDerivativeTolerance * length * r.stableNorm()) {
-            throw std::domain_error("ankle second derivative is undefined at a transmission singularity");
-        }
-
-        Eigen::Matrix<double, 3, 2> first;
-        first.col(0) = Eigen::Vector3d::UnitY().cross(pitch_relative / scale);
-        first.col(1) = pitch * Eigen::Vector3d::UnitX().cross(rolled / scale);
-        const Eigen::Vector3d pp = Eigen::Vector3d::UnitY().cross(first.col(0));
-        const Eigen::Vector3d pr = Eigen::Vector3d::UnitY().cross(first.col(1));
-        const Eigen::Vector3d rr = pitch * Eigen::Vector3d::UnitX().cross(
-                                                  Eigen::Vector3d::UnitX().cross(rolled / scale));
-        const Eigen::Vector2d gradient = direction * evaluation.jacobian.row(index).transpose();
-        Eigen::Matrix2d hessian;
-        for (int j = 0; j < 2; ++j) {
-            for (int k = j; k < 2; ++k) {
-                const Eigen::Vector3d& second = j == 0 && k == 0 ? pp : (j == 1 && k == 1 ? rr : pr);
-                const double numerator = first.col(j).dot(first.col(k)) + v.dot(second) -
-                                         length * (first.col(j).dot(u_prime) * gradient(k) +
-                                                   first.col(k).dot(u_prime) * gradient(j)) +
-                                         length * r.dot(u) * gradient(j) * gradient(k);
-                const double value = direction * numerator / denominator;
-                hessian(j, k) = value;
-                hessian(k, j) = value;
-            }
-        }
-        if (!hessian.allFinite()) {
-            throw std::overflow_error("ankle angle Hessian produced nonfinite entries");
-        }
-        evaluation.hessians[index] = hessian;
-    }
-    return evaluation;
-}
-
-double FiniteMidpoint(double first, double second) {
-    if (first == second) {
-        return first;
-    }
-    constexpr double half_max = std::numeric_limits<double>::max() * 0.5;
-    constexpr double twice_min = std::numeric_limits<double>::min() * 2.0;
-    const double first_magnitude = std::abs(first);
-    const double second_magnitude = std::abs(second);
-    if (first_magnitude <= half_max && second_magnitude <= half_max) {
-        // Add before halving to preserve subnormal midpoints, including the
-        // ties-to-even midpoint of denorm_min and 2*denorm_min.
-        return (first + second) * 0.5;
-    }
-    if (first_magnitude < twice_min) {
-        return first + second * 0.5;
-    }
-    if (second_magnitude < twice_min) {
-        return first * 0.5 + second;
-    }
-    // Both halves are normal here. This also handles opposite large signs
-    // without overflowing either their sum or their difference.
-    return first * 0.5 + second * 0.5;
-}
-
-Eigen::Matrix2d SymmetricAverage(const Eigen::Matrix2d& matrix) {
-    Eigen::Matrix2d symmetric = matrix;
-    const double off_diagonal = FiniteMidpoint(matrix(0, 1), matrix(1, 0));
-    symmetric(0, 1) = off_diagonal;
-    symmetric(1, 0) = off_diagonal;
-    return symmetric;
-}
+constexpr double kSemidefiniteTolerance = 128.0 * std::numeric_limits<double>::epsilon();
 
 Eigen::Matrix2d SymmetricInput(const Eigen::Matrix2d& matrix) {
     if (!matrix.allFinite()) {
@@ -143,7 +31,7 @@ Eigen::Matrix2d SymmetricInput(const Eigen::Matrix2d& matrix) {
     }
     // Normalization is only for the relative symmetry check. Reconstructing
     // from it would erase small representable entries in a mixed-scale input.
-    return SymmetricAverage(matrix);
+    return detail::SymmetricAverage(matrix);
 }
 
 bool PositiveSemidefinite(const Eigen::Matrix2d& matrix) {
@@ -157,13 +45,13 @@ bool PositiveSemidefinite(const Eigen::Matrix2d& matrix) {
         throw std::overflow_error("stiffness spectral diagnostic failed");
     }
     const double spectral_scale = solver.eigenvalues().cwiseAbs().maxCoeff();
-    return solver.eigenvalues().minCoeff() >= -kDerivativeTolerance * spectral_scale;
+    return solver.eigenvalues().minCoeff() >= -kSemidefiniteTolerance * spectral_scale;
 }
 
 }  // namespace
 
 std::array<Eigen::Matrix2d, 2> ComputeMotorAngleHessians(const PMAnkle& model, double pitch_rad, double roll_rad) {
-    return EvaluateDerivatives(model, pitch_rad, roll_rad).hessians;
+    return detail::EvaluateAnkleDerivatives(model.parameters(), pitch_rad, roll_rad).hessians;
 }
 
 LoadedStaticStiffnessResult MapLoadedStaticTaskStiffness(const PMAnkle& model,
@@ -175,7 +63,7 @@ LoadedStaticStiffnessResult MapLoadedStaticTaskStiffness(const PMAnkle& model,
     if (!motor_preload.allFinite()) {
         throw std::invalid_argument("motor preload must be finite");
     }
-    const auto derivatives = EvaluateDerivatives(model, pitch_rad, roll_rad);
+    const auto derivatives = detail::EvaluateAnkleDerivatives(model.parameters(), pitch_rad, roll_rad);
     Eigen::FullPivLU<Eigen::Matrix2d> factor(derivatives.jacobian);
     factor.setThreshold(kRankThreshold);
     if (!factor.isInvertible()) {
@@ -189,26 +77,9 @@ LoadedStaticStiffnessResult MapLoadedStaticTaskStiffness(const PMAnkle& model,
     if (!inverse.allFinite() || !result.geometric_stiffness.allFinite() || !corrected.allFinite()) {
         throw std::overflow_error("loaded stiffness mapping produced nonfinite entries");
     }
-    // A small entry can underflow in the first double product and become
-    // representable again after the second factor. Keep the congruence in
-    // extended precision until both factors have been applied. This leaves
-    // the preload correction's existing double arithmetic contract intact.
-    using ExtendedMatrix = Eigen::Matrix<long double, 2, 2>;
-    const ExtendedMatrix extended_inverse = inverse.cast<long double>();
-    const ExtendedMatrix extended_corrected = corrected.cast<long double>();
-    const ExtendedMatrix extended_motor = extended_inverse.transpose() * extended_corrected * extended_inverse;
-    constexpr long double double_max = std::numeric_limits<double>::max();
-    Eigen::Matrix2d motor;
-    for (int row = 0; row < 2; ++row) {
-        for (int column = 0; column < 2; ++column) {
-            const long double value = extended_motor(row, column);
-            if (!std::isfinite(value) || std::abs(value) > double_max) {
-                throw std::overflow_error("loaded stiffness is not representable as a finite double matrix");
-            }
-            motor(row, column) = static_cast<double>(value);
-        }
+    if (!detail::TryTransformSymmetricGains(inverse, corrected, result.motor_stiffness)) {
+        throw std::overflow_error("loaded stiffness is not representable as a finite double matrix");
     }
-    result.motor_stiffness = SymmetricAverage(motor);
     result.task_positive_semidefinite = PositiveSemidefinite(task);
     result.motor_positive_semidefinite = PositiveSemidefinite(result.motor_stiffness);
     return result;

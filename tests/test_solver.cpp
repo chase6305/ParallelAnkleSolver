@@ -99,6 +99,29 @@ TEST(ForwardKinematics, RecoverPosesForBothFeet) {
     }
 }
 
+TEST(ForwardKinematics, ReuseTheAcceptedPoseAfterAnUnreachableNewtonStep) {
+    const PMAnkle ankle(true, LegacyParams(true));
+    const Eigen::Vector2d expected(0.2, -0.4);
+    const auto target = ankle.GetAnkleMotorAngles(expected.x(), expected.y());
+    ASSERT_TRUE(target.success());
+
+    ForwardOptions options;
+    options.initial_guess = {-0.8, 0.2};
+    const auto initial = ankle.GetAnkleMotorAngles(options.initial_guess.x(), options.initial_guess.y());
+    ASSERT_TRUE(initial.success());
+    const Eigen::Matrix2d jacobian = ankle.ComputeJacobian(options.initial_guess.x(), options.initial_guess.y());
+    const Eigen::Vector2d step = jacobian.fullPivLu().solve(initial.motor_angles() - target.motor_angles());
+    const Eigen::Vector2d full_step = options.initial_guess - step;
+    ASSERT_FALSE(ankle.GetAnkleMotorAngles(full_step.x(), full_step.y()).success());
+
+    const auto result = ankle.SolveForwardKinematics(target.theta_1_rad, target.theta_2_rad, options);
+    ASSERT_TRUE(result.success()) << ToString(result.status);
+    EXPECT_GT(result.iterations, 1);
+    EXPECT_LT((result.pose - expected).norm(), 2e-8);
+    EXPECT_LE(result.residual_norm, options.tolerance_rad);
+    ExpectRodClosure(ankle.parameters(), result.pose, target.motor_angles());
+}
+
 TEST(ForwardKinematics, ReportInvalidInputsAndIterationLimit) {
     const PMAnkle ankle(true, LegacyParams(true));
     EXPECT_EQ(ankle.SolveForwardKinematics(kNaN, 0.0).status, ForwardStatus::InvalidInput);
@@ -174,6 +197,30 @@ TEST(Mappings, PreserveGainEnergyAndCoupling) {
     EXPECT_GT(std::abs(stiffness(0, 1)), 1e-3);
     EXPECT_THROW(ankle.GetMotorStiffnessMatrixFromTaskStiffness(0.0, 0.0, -1.0, 1.0), std::invalid_argument);
     EXPECT_THROW(ankle.GetTaskTorquesFromMotorTorques(0.0, 0.0, kNaN, 1.0), std::invalid_argument);
+}
+
+TEST(Mappings, PreserveSymmetricSubnormalGainAfterBothFactors) {
+    AnkleParams params;
+    params.r_c1 = {-4.0, -16.0, 0.0};
+    params.r_a1 = {-4.0, -17.0, 1.0};
+    params.r_c2 = {0.0, 1.0, 0.0};
+    params.r_a2 = {0.0, 0.0, 1.0};
+    params.l_bar1 = params.l_bar2 = params.l_rod1 = params.l_rod2 = 1.0;
+    params.is_left_motor1 = params.is_left_motor2 = true;
+    const PMAnkle ankle(true, params);
+    Eigen::Matrix2d jacobian;
+    jacobian << 4.0, -16.0, 0.0, 1.0;
+    ASSERT_EQ(ankle.ComputeJacobian(0.0, 0.0), jacobian);
+
+    // The first row of J^-1 is [1/4, 4]. Multiplying the gain by 1/4
+    // first would erase it before the factor of 4 restores its magnitude.
+    const double gain = std::numeric_limits<double>::denorm_min();
+    Eigen::Matrix2d expected;
+    expected << 0.0, gain, gain, 16.0 * gain;
+    EXPECT_EQ(ankle.GetMotorStiffnessMatrixFromTaskStiffness(0.0, 0.0, gain, 0.0), expected);
+    EXPECT_EQ(ankle.GetMotorDampingMatrixFromTaskDamping(0.0, 0.0, gain, 0.0), expected);
+    EXPECT_THROW(ankle.GetMotorStiffnessMatrixFromTaskStiffness(0.0, 0.0, std::numeric_limits<double>::max(), 0.0),
+                 std::overflow_error);
 }
 
 TEST(Mappings, RejectSingularInverseMappings) {

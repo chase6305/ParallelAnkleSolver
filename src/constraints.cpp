@@ -62,12 +62,56 @@ Evaluation EvaluateJacobian(const EqualityProblem& problem, const Eigen::VectorX
     return {};
 }
 
-Eigen::MatrixXd ScaledJacobian(const Eigen::MatrixXd& matrix,
-                               const Eigen::VectorXd& row_scales,
-                               const Eigen::VectorXd& column_scales) {
-    Eigen::MatrixXd scaled = matrix.array().colwise() / row_scales.array();
-    scaled.array().rowwise() *= column_scales.transpose().array();
-    return scaled;
+void ScaleJacobian(Eigen::MatrixXd& matrix,
+                   const Eigen::VectorXd& row_scales,
+                   const Eigen::VectorXd& column_scales) {
+    if ((row_scales.array() == 1.0).all()) {
+        matrix.array().rowwise() *= column_scales.transpose().array();
+        return;
+    }
+    for (Eigen::Index column = 0; column < matrix.cols(); ++column) {
+        const double column_scale = column_scales(column);
+        for (Eigen::Index row = 0; row < matrix.rows(); ++row) {
+            double& value = matrix(row, column);
+            if (value == 0.0) {
+                continue;
+            }
+            const double row_scale = row_scales(row);
+            const double divided = value / row_scale;
+            if (std::isnormal(divided)) {
+                value = divided * column_scale;
+                continue;
+            }
+            // Apply both scales in exponent space when the division alone
+            // would overflow or discard significant bits in a subnormal.
+            int value_exponent;
+            int row_exponent;
+            int column_exponent;
+            const double value_fraction = std::frexp(value, &value_exponent);
+            const double row_fraction = std::frexp(row_scale, &row_exponent);
+            const double column_fraction = std::frexp(column_scale, &column_exponent);
+            value = std::ldexp((value_fraction / row_fraction) * column_fraction,
+                               value_exponent - row_exponent + column_exponent);
+        }
+    }
+}
+
+void ScaleByPowerOfTwo(Eigen::MatrixXd& matrix, int exponent) {
+    matrix = matrix.unaryExpr([exponent](double value) { return std::scalbn(value, exponent); });
+}
+
+int SubnormalExponent(double magnitude) {
+    return magnitude != 0.0 && magnitude < std::numeric_limits<double>::min() ? std::ilogb(magnitude) : 0;
+}
+
+int RescaleSubnormalJacobian(Eigen::MatrixXd& jacobian) {
+    const int exponent = SubnormalExponent(jacobian.cwiseAbs().maxCoeff());
+    if (exponent != 0) {
+        // Preserve relative rank when the coefficients fall below the
+        // absolute threshold floor of the decomposition.
+        ScaleByPowerOfTwo(jacobian, -exponent);
+    }
+    return exponent;
 }
 
 double DampedInverse(double singular_value, double damping) {
@@ -76,6 +120,23 @@ double DampedInverse(double singular_value, double damping) {
     const double sigma = singular_value / scale;
     const double lambda = damping / scale;
     return (sigma / (sigma * sigma + lambda * lambda)) / scale;
+}
+
+double DampedRescaledCorrection(double singular_value,
+                                double projection,
+                                double damping,
+                                int jacobian_exponent,
+                                int residual_exponent) {
+    const int singular_exponent = std::ilogb(singular_value) + jacobian_exponent;
+    const int scale_exponent = damping == 0.0 ? singular_exponent : std::max(singular_exponent, std::ilogb(damping));
+    const double sigma = std::scalbn(singular_value, jacobian_exponent - scale_exponent);
+    const double lambda = std::scalbn(damping, -scale_exponent);
+    int projection_exponent;
+    const double fraction = std::frexp(projection, &projection_exponent);
+    // Fold the projection into the correction before applying the exponent.
+    // An explicit inverse singular value can overflow at this scale.
+    return std::scalbn(fraction * singular_value / (sigma * sigma + lambda * lambda),
+                       projection_exponent + residual_exponent + jacobian_exponent - 2 * scale_exponent);
 }
 
 }  // namespace
@@ -131,6 +192,25 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
         result.message = evaluation.message;
         return result;
     }
+    Eigen::VectorXd residual = result.residual.cwiseQuotient(row_scales);
+    result.scaled_residual_norm = residual.stableNorm();
+    if (!residual.allFinite() || !std::isfinite(result.scaled_residual_norm)) {
+        result.status = Status::NumericalFailure;
+        result.message = "residual scaling overflowed";
+        return result;
+    }
+
+    Eigen::MatrixXd jacobian;
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd;
+    svd.setThreshold(options.rank_tolerance);
+    Eigen::VectorXd filter;
+    Eigen::VectorXd projection;
+    Eigen::VectorXd step;
+    Eigen::VectorXd unprojected;
+    Eigen::VectorXd candidate;
+    Eigen::VectorXd actual_step;
+    Eigen::VectorXd candidate_residual;
+    Eigen::VectorXd scaled_candidate_residual;
     bool small_step = false;
     for (int iteration = 0; iteration <= options.max_iterations; ++iteration) {
         result.iterations = iteration;
@@ -138,15 +218,6 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
         // regularity here if this iterate's callback or scaling fails.
         result.rank = 0;
         result.full_column_rank = false;
-        const Eigen::VectorXd residual = result.residual.cwiseQuotient(row_scales);
-        result.scaled_residual_norm = residual.stableNorm();
-        if (!residual.allFinite() || !std::isfinite(result.scaled_residual_norm)) {
-            result.status = Status::NumericalFailure;
-            result.message = "residual scaling overflowed";
-            return result;
-        }
-
-        Eigen::MatrixXd jacobian;
         ++result.jacobian_evaluations;
         evaluation = EvaluateJacobian(problem, result.x, jacobian);
         if (evaluation.status != Status::Success) {
@@ -154,14 +225,14 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
             result.message = evaluation.message;
             return result;
         }
-        jacobian = ScaledJacobian(jacobian, row_scales, column_scales);
+        ScaleJacobian(jacobian, row_scales, column_scales);
         if (!jacobian.allFinite()) {
             result.status = Status::NumericalFailure;
             result.message = "Jacobian scaling overflowed";
             return result;
         }
-        Eigen::JacobiSVD<Eigen::MatrixXd> svd(jacobian, Eigen::ComputeThinU | Eigen::ComputeThinV);
-        svd.setThreshold(options.rank_tolerance);
+        const int jacobian_exponent = RescaleSubnormalJacobian(jacobian);
+        svd.compute(jacobian, Eigen::ComputeThinU | Eigen::ComputeThinV);
         if (svd.info() != Eigen::Success || !svd.singularValues().allFinite()) {
             result.status = Status::NumericalFailure;
             result.message = "Jacobian decomposition failed";
@@ -188,11 +259,29 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
             return result;
         }
 
-        Eigen::VectorXd filter = Eigen::VectorXd::Zero(svd.singularValues().size());
-        for (Eigen::Index index = 0; index < result.rank; ++index) {
-            filter(index) = DampedInverse(svd.singularValues()(index), options.damping);
+        if (jacobian_exponent == 0) {
+            filter.setZero(svd.singularValues().size());
+            for (Eigen::Index index = 0; index < result.rank; ++index) {
+                filter(index) = DampedInverse(svd.singularValues()(index), options.damping);
+            }
+            step = -svd.matrixV() * filter.asDiagonal() * (svd.matrixU().transpose() * residual);
+        } else {
+            const int residual_exponent = SubnormalExponent(residual.cwiseAbs().maxCoeff());
+            projection = svd.matrixU().transpose() * residual.unaryExpr([residual_exponent](double value) {
+                return std::scalbn(value, -residual_exponent);
+            });
+            projection.tail(projection.size() - result.rank).setZero();
+            if (!projection.allFinite()) {
+                result.status = Status::NumericalFailure;
+                result.message = "residual projection overflowed";
+                return result;
+            }
+            for (Eigen::Index index = 0; index < result.rank; ++index) {
+                projection(index) = DampedRescaledCorrection(svd.singularValues()(index), projection(index),
+                                                              options.damping, jacobian_exponent, residual_exponent);
+            }
+            step = -svd.matrixV() * projection;
         }
-        const Eigen::VectorXd step = -svd.matrixV() * filter.asDiagonal() * (svd.matrixU().transpose() * residual);
         if (!step.allFinite()) {
             result.status = Status::NumericalFailure;
             result.message = "local correction overflowed";
@@ -207,10 +296,10 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
         double alpha = 1.0;
         Evaluation last_failure{Status::CallbackFailure, "no trial could be evaluated"};
         for (int attempt = 0; attempt < options.max_backtracking; ++attempt) {
-            const Eigen::VectorXd unprojected = result.x + (column_scales.array() * (alpha * step.array())).matrix();
-            const Eigen::VectorXd candidate = unprojected.cwiseMax(lower).cwiseMin(upper);
+            unprojected = result.x + (column_scales.array() * (alpha * step.array())).matrix();
+            candidate = unprojected.cwiseMax(lower).cwiseMin(upper);
             bounds_restricted = bounds_restricted || (candidate.array() != unprojected.array()).any();
-            const Eigen::VectorXd actual_step = (candidate - result.x).cwiseQuotient(column_scales);
+            actual_step = (candidate - result.x).cwiseQuotient(column_scales);
             const double step_norm = actual_step.stableNorm();
             const bool finite_trial = candidate.allFinite() && actual_step.allFinite() && std::isfinite(step_norm);
             any_finite_trial = any_finite_trial || finite_trial;
@@ -219,7 +308,6 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
             }
             if (finite_trial && step_norm > 0.0) {
                 any_movement = true;
-                Eigen::VectorXd candidate_residual;
                 ++result.residual_evaluations;
                 evaluation = EvaluateResidual(problem, candidate, candidate_residual);
                 if (evaluation.status == Status::InvalidEvaluation) {
@@ -228,13 +316,15 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
                     return result;
                 }
                 if (evaluation.status == Status::Success) {
-                    const Eigen::VectorXd scaled = candidate_residual.cwiseQuotient(row_scales);
-                    const double norm = scaled.stableNorm();
-                    if (scaled.allFinite() && std::isfinite(norm)) {
+                    scaled_candidate_residual = candidate_residual.cwiseQuotient(row_scales);
+                    const double norm = scaled_candidate_residual.stableNorm();
+                    if (scaled_candidate_residual.allFinite() && std::isfinite(norm)) {
                         any_valid_trial = true;
                         if (norm <= options.residual_tolerance || norm < result.scaled_residual_norm) {
                             result.x = candidate;
                             result.residual = candidate_residual;
+                            result.scaled_residual_norm = norm;
+                            residual.swap(scaled_candidate_residual);
                             result.scaled_step_norm = step_norm;
                             small_step = step_norm <= options.step_tolerance;
                             accepted = true;
@@ -282,12 +372,24 @@ DerivativeResult DifferentiateImplicitly(const Eigen::MatrixXd& a,
     result.derivative = Eigen::MatrixXd::Constant(a.cols(), b.cols(), std::numeric_limits<double>::quiet_NaN());
     const auto row_scales = ScalesOrOnes(options.equation_scales, a.rows());
     const auto column_scales = ScalesOrOnes(options.variable_scales, a.cols());
-    const Eigen::MatrixXd normalized_a = ScaledJacobian(a, row_scales, column_scales);
-    const Eigen::MatrixXd normalized_b = b.array().colwise() / row_scales.array();
+    Eigen::MatrixXd normalized_a = a;
+    ScaleJacobian(normalized_a, row_scales, column_scales);
+    Eigen::MatrixXd normalized_b = b.array().colwise() / row_scales.array();
     if (!normalized_a.allFinite() || !normalized_b.allFinite()) {
         result.status = Status::NumericalFailure;
         result.message = "implicit derivative scaling overflowed";
         return result;
+    }
+    const int jacobian_exponent = RescaleSubnormalJacobian(normalized_a);
+    double system_scale = 1.0;
+    if (jacobian_exponent != 0) {
+        ScaleByPowerOfTwo(normalized_b, -jacobian_exponent);
+        if (!normalized_b.allFinite()) {
+            result.status = Status::NumericalFailure;
+            result.message = "implicit derivative scaling overflowed";
+            return result;
+        }
+        system_scale = std::scalbn(1.0, jacobian_exponent);
     }
     Eigen::JacobiSVD<Eigen::MatrixXd> svd(normalized_a, Eigen::ComputeThinU | Eigen::ComputeThinV);
     svd.setThreshold(options.rank_tolerance);
@@ -304,7 +406,7 @@ DerivativeResult DifferentiateImplicitly(const Eigen::MatrixXd& a,
     }
     const Eigen::MatrixXd normalized_derivative = svd.solve(-normalized_b);
     const Eigen::MatrixXd error = normalized_a * normalized_derivative + normalized_b;
-    result.scaled_residual_norm = error.stableNorm();
+    result.scaled_residual_norm = error.stableNorm() * system_scale;
     // Check each independent direction separately. A large consistent column
     // must not hide an inconsistent smaller right-hand side.
     result.relative_residual = 0.0;
@@ -355,7 +457,7 @@ DerivativeResult DifferentiateImplicitly(const Eigen::MatrixXd& a,
         result.message = "returned implicit derivative cannot represent the normalized solution";
         return result;
     }
-    result.scaled_residual_norm = represented_error.stableNorm();
+    result.scaled_residual_norm = represented_error.stableNorm() * system_scale;
     result.relative_residual = 0.0;
     for (Eigen::Index column = 0; column < b.cols(); ++column) {
         const double error_norm = represented_error.col(column).stableNorm();

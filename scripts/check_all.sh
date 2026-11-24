@@ -35,5 +35,5 @@ if ${with_benchmark}; then
     acquire_heavy_work_lock
     timeout 60s nice -n 10 cmake -S "${project_dir}" -B "${build_dir}" -DPARALLEL_ANKLE_BUILD_BENCHMARKS=ON
     timeout 120s nice -n 10 cmake --build "${build_dir}" --target benchmark_jacobians --parallel 2
-    timeout 15s nice -n 10 "${build_dir}/benchmark_jacobians" 5000
+    timeout 15s nice -n 10 "${build_dir}/benchmark_jacobians" 5000 --kinematics
 fi

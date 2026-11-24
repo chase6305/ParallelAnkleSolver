@@ -22,6 +22,27 @@ struct CrankPhaseCheck {
     bool selected_working_root = false;
 };
 
+inline bool CheckRodLength(long double x, long double y, long double z, long double rod) {
+    constexpr int double_subnormal_exponent = std::numeric_limits<double>::min_exponent -
+                                              std::numeric_limits<double>::digits;
+    // The three components are differences of double-scale coordinates and
+    // crank components. Use their squares only with a wider exponent range.
+    if constexpr (std::numeric_limits<long double>::max_exponent >
+                      2 * std::numeric_limits<double>::max_exponent + 4 &&
+                  std::numeric_limits<long double>::min_exponent <
+                      2 * double_subnormal_exponent - std::numeric_limits<double>::digits) {
+        const long double squared_length = x * x + y * y + z * z;
+        const long double squared_rod = rod * rod;
+        // The same relative bound on squared lengths certifies an interior
+        // point of the length tolerance band. Near its edge use the norm.
+        if (std::abs(squared_length - squared_rod) <= kCrankRodTolerance * squared_rod) {
+            return true;
+        }
+    }
+    const long double actual = std::hypot(x, y, z);
+    return std::isfinite(actual) && std::abs(actual - rod) <= kCrankRodTolerance * rod;
+}
+
 // Use rod-relative physical and working-root residuals, never tolerances
 // proportional to the square of a possibly much longer crank/displacement.
 // Share the long-double trigonometric evaluation for both checks.
@@ -40,7 +61,6 @@ inline CrankPhaseCheck CheckCrankPhase(const Eigen::Vector3d& delta,
     const long double y = static_cast<long double>(delta.y()) -
                           static_cast<long double>(bar) * side * cosine;
     const long double z = static_cast<long double>(delta.z()) - static_cast<long double>(bar) * sine;
-    const long double actual = std::hypot(x, y, z);
     // The positive square-root branch has rho*sin(opening) >= 0. Closure alone cannot
     // distinguish its neighboring root after encoder rounding. Only rod-scale
     // roundoff is admitted at tangency, even with an enormous crank length.
@@ -62,8 +82,7 @@ inline CrankPhaseCheck CheckCrankPhase(const Eigen::Vector3d& delta,
         const long double fused = std::fma(std::abs(static_cast<long double>(delta.y())), sine, -second);
         selected = std::isfinite(fused) && fused >= -tolerance;
     }
-    return {std::isfinite(actual) && std::abs(actual - rod) <= tolerance,
-            selected};
+    return {CheckRodLength(x, y, z, rod), selected};
 }
 
 inline CrankPhase SolveCrankPhase(const Eigen::Vector3d& delta, double bar, double rod, double side) {

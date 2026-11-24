@@ -8,7 +8,7 @@ endif()
 option(PARALLEL_ANKLE_WITH_YAML "Build the YAML profile loader" ON)
 option(PARALLEL_ANKLE_BUILD_EXAMPLES "Build examples" ${parallel_ankle_top_level})
 option(PARALLEL_ANKLE_BUILD_TESTS "Build tests with an installed GoogleTest" ${parallel_ankle_top_level})
-option(PARALLEL_ANKLE_BUILD_BENCHMARKS "Build bounded Jacobian microbenchmark" OFF)
+option(PARALLEL_ANKLE_BUILD_BENCHMARKS "Build bounded ankle kinematics microbenchmark" OFF)
 
 include(GNUInstallDirs)
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)

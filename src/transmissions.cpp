@@ -38,13 +38,7 @@ bool NarrowGradient(const ExtendedVector& gradient, Eigen::Vector3d& result) {
     return result.allFinite();
 }
 
-bool RodCloses(const ExtendedVector& delta,
-               const ExtendedVector& u,
-               const ExtendedVector& v,
-               long double crank,
-               long double rod,
-               long double phase) {
-    const ExtendedVector residual = delta - crank * (u * std::cos(phase) + v * std::sin(phase));
+bool RodCloses(const ExtendedVector& residual, long double rod) {
     const long double actual = Norm(residual);
     return std::isfinite(actual) && std::abs(actual - rod) <= kRodTolerance * rod;
 }
@@ -169,28 +163,37 @@ RotaryRodResult SolveRotaryRod(const RotaryRodParams& params, const Eigen::Vecto
         const long double phase = center + (index == 0 ? opening : -opening);
         solution.crank_phase_rad = NarrowPhase(phase);
         solution.motor_phase_rad = NarrowPhase(params.motor_sign * phase + offset);
+        const long double gamma = solution.crank_phase_rad;
+        const long double sine = std::sin(gamma);
+        const long double cosine = std::cos(gamma);
+        const ExtendedVector link = delta - crank * (u * cosine + v * sine);
+        if (!RodCloses(link, rod)) {
+            return RotaryFailure(TransmissionStatus::NumericalFailure);
+        }
         const long double recovered_phase = CanonicalPhase(params.motor_sign *
                                                            (static_cast<long double>(solution.motor_phase_rad) - offset));
-        if (!RodCloses(delta, u, v, crank, rod, solution.crank_phase_rad) ||
-            !RodCloses(delta, u, v, crank, rod, recovered_phase)) {
+        const bool phase_changed = recovered_phase != gamma;
+        const long double recovered_sine = phase_changed ? std::sin(recovered_phase) : sine;
+        const long double recovered_cosine = phase_changed ? std::cos(recovered_phase) : cosine;
+        if (phase_changed && !RodCloses(delta - crank * (u * recovered_cosine + v * recovered_sine), rod)) {
             return RotaryFailure(TransmissionStatus::NumericalFailure);
         }
         if (tangent) {
             continue;
         }
-        const long double gamma = solution.crank_phase_rad;
-        const ExtendedVector unit = u * std::cos(gamma) + v * std::sin(gamma);
-        const ExtendedVector tangent_direction = -u * std::sin(gamma) + v * std::cos(gamma);
+        const ExtendedVector tangent_direction = -u * sine + v * cosine;
         const long double denominator = crank * delta.dot(tangent_direction);
         if (denominator == 0.0L || !std::isfinite(denominator)) {
             return RotaryFailure(TransmissionStatus::NumericalFailure);
         }
-        const ExtendedVector recovered_tangent = -u * std::sin(recovered_phase) + v * std::cos(recovered_phase);
-        const long double recovered_denominator = crank * delta.dot(recovered_tangent);
-        if (recovered_denominator == 0.0L || (recovered_denominator > 0.0L) != (denominator > 0.0L)) {
-            return RotaryFailure(TransmissionStatus::NumericalFailure);
+        if (phase_changed) {
+            const ExtendedVector recovered_tangent = -u * recovered_sine + v * recovered_cosine;
+            const long double recovered_denominator = crank * delta.dot(recovered_tangent);
+            if (recovered_denominator == 0.0L || (recovered_denominator > 0.0L) != (denominator > 0.0L)) {
+                return RotaryFailure(TransmissionStatus::NumericalFailure);
+            }
         }
-        const ExtendedVector gradient = (delta - crank * unit) / (scale * denominator);
+        const ExtendedVector gradient = link / (scale * denominator);
         if (!NarrowGradient(gradient, solution.crank_gradient) ||
             !NarrowGradient(params.motor_sign * gradient, solution.motor_gradient)) {
             return RotaryFailure(TransmissionStatus::NumericalFailure);
