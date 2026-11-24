@@ -453,5 +453,71 @@ TEST(ConstraintsScaling, PreserveRepresentableCombinedRowAndColumnScales) {
     }
 }
 
+TEST(ConstraintsScaling, SolveSubnormalJacobianWithDampedAndUndampedSteps) {
+    const double scale = std::ldexp(1.0, -1030);
+    const Eigen::MatrixXd jacobian = Eigen::MatrixXd::Constant(1, 1, scale);
+    const Eigen::VectorXd rhs = Eigen::VectorXd::Constant(1, scale);
+    const auto problem = AffineProblem(jacobian, rhs);
+
+    SolveOptions options;
+    options.damping = 0.0;
+    options.residual_tolerance = std::numeric_limits<double>::denorm_min();
+    const auto undamped = SolveEqualities(problem, Eigen::VectorXd::Zero(1), options);
+    ASSERT_TRUE(undamped.success()) << undamped.message;
+    EXPECT_EQ(undamped.rank, 1);
+    EXPECT_EQ(undamped.x(0), 1.0);
+
+    options.damping = scale;
+    options.max_iterations = 1;
+    const auto damped = SolveEqualities(problem, Eigen::VectorXd::Zero(1), options);
+    EXPECT_EQ(damped.status, Status::MaxIterations);
+    EXPECT_EQ(damped.rank, 1);
+    EXPECT_EQ(damped.x(0), 0.5);
+    EXPECT_EQ(damped.scaled_residual_norm, 0.5 * scale);
+}
+
+TEST(ConstraintsScaling, PreserveSubnormalResidualDirectionsThroughTheSvdProjection) {
+    const double tiny = std::numeric_limits<double>::denorm_min();
+    Eigen::Matrix2d jacobian;
+    jacobian << tiny, tiny, 0.0, tiny;
+    const Eigen::Vector2d expected(2.0, 2.0);
+    SolveOptions options;
+    options.damping = 0.0;
+    options.max_iterations = 1;
+    options.residual_tolerance = tiny;
+
+    const auto result = SolveEqualities(AffineProblem(jacobian, jacobian * expected), Eigen::Vector2d::Zero(), options);
+    ASSERT_TRUE(result.success()) << result.message;
+    EXPECT_EQ(result.rank, 2);
+    EXPECT_TRUE(result.x.isApprox(expected, 1e-13));
+}
+
+TEST(ConstraintsScaling, RetainRelativeRankAndConsistencyForSubnormalImplicitSystems) {
+    const double scale = std::ldexp(1.0, -1030);
+    Eigen::MatrixXd a(3, 2);
+    a << 2.0, 1.0, 1.0, 3.0, 0.0, 2.0;
+    a *= scale;
+    Eigen::Matrix2d expected;
+    expected << 1.0, -2.0, 3.0, 1.0;
+    Eigen::MatrixXd rhs = -a * expected;
+
+    const auto consistent = DifferentiateImplicitly(a, rhs);
+    ASSERT_TRUE(consistent.success()) << consistent.message;
+    EXPECT_EQ(consistent.rank, 2);
+    EXPECT_TRUE(consistent.derivative.isApprox(expected, 1e-13));
+
+    rhs(2, 0) += scale;
+    const auto inconsistent = DifferentiateImplicitly(a, rhs);
+    EXPECT_EQ(inconsistent.status, Status::Inconsistent);
+    EXPECT_EQ(inconsistent.rank, 2);
+    EXPECT_GT(inconsistent.relative_residual, 0.01);
+    EXPECT_GT(inconsistent.scaled_residual_norm, 0.0);
+
+    a.col(1) = a.col(0);
+    const auto singular = DifferentiateImplicitly(a, rhs);
+    EXPECT_EQ(singular.status, Status::RankDeficient);
+    EXPECT_EQ(singular.rank, 1);
+}
+
 }  // namespace
 }  // namespace parallel_ankle::constraints
