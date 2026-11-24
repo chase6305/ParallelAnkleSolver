@@ -228,6 +228,34 @@ TEST(Geometry, ValidateEncodedShortRodAndOutOfPlaneReachInRodUnits) {
     EXPECT_TRUE(outside.success_2);
 }
 
+TEST(Geometry, CheckEncodedRodLengthAtTheToleranceBoundary) {
+    constexpr double tolerance = 512.0 * std::numeric_limits<double>::epsilon();
+    constexpr double encoded_phase = 0.5;
+    for (bool within_tolerance : {true, false}) {
+        SCOPED_TRACE(within_tolerance);
+        const double phase = encoded_phase + (within_tolerance ? 0.75 : 1.25) * tolerance;
+        const double sine = std::sin(phase);
+        const double cosine = std::cos(phase);
+        // The chosen unit rod is minus the crank tangent at phase.
+        auto params = IdenticalActuators({0.0, cosine + sine, sine - cosine}, 1.0, 1.0);
+        params.alpha_1_rad = 2048.0;
+        const auto solution = PMAnkle(true, params).GetAnkleMotorAngles(0.0, 0.0);
+        ASSERT_TRUE(solution.success_2);
+        EXPECT_NEAR(solution.theta_2_rad, phase, 2e-15);
+
+        const long double represented_phase = encoded_phase;
+        const long double y = static_cast<long double>(params.r_c1.y()) - std::cos(represented_phase);
+        const long double z = static_cast<long double>(params.r_c1.z()) - std::sin(represented_phase);
+        const long double encoded_rod_error = std::abs(std::hypot(y, z) - 1.0L);
+        EXPECT_GT(encoded_rod_error, 0.5L * tolerance);
+        EXPECT_EQ(encoded_rod_error <= tolerance, within_tolerance);
+        EXPECT_EQ(solution.status_1, within_tolerance ? InverseStatus::Success : InverseStatus::NumericalFailure);
+        if (within_tolerance) {
+            EXPECT_EQ(solution.theta_1_rad - params.alpha_1_rad, encoded_phase);
+        }
+    }
+}
+
 TEST(Geometry, PreserveSelectedShortRodRootWhenAnotherRootAlsoCloses) {
     const double crank = std::ldexp(1.0, 42);
     auto params = IdenticalActuators({0.0, crank, 1.0}, crank, 1.0);
