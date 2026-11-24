@@ -56,7 +56,7 @@
 | `SolvePrismaticLength` | 三维连接点 | 支链长度、行程和方向梯度 |
 | `SolveEqualities` | 用户的闭环方程与初值 | 局部欧氏约束解、边界与秩诊断 |
 
-各模型的完整坐标与单位约定见 [backends.md](docs/backends.md)。安装/嵌入消费与可选短时基准入口为 `./scripts/check_all.sh --benchmark`；GCC/Clang 的地址/未定义行为检查入口为 `./scripts/check_sanitizers.sh`。这些脚本都使用相同共享锁。
+各模型的完整坐标与单位约定见 [backends.md](docs/backends.md)。`./scripts/check_all.sh --benchmark` 检查安装和嵌入消费，并在固定样本上测量逆解、正解、一阶和二阶导数。GCC/Clang 的地址和未定义行为检查入口为 `./scripts/check_sanitizers.sh`。这些脚本都使用相同共享锁。
 
 资源锁的轻量协议检查为 `./scripts/check_lock_protocol.sh`，仅使用独立临时锁验证继承和退出释放，不执行编译或数值计算；它不替代实际资源余量检查。
 
