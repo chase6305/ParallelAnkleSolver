@@ -221,3 +221,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local CMake builds and editor artifacts
+/build*/
+/install/
+/.idea/
+/.vscode/
+compile_commands.json
+*.swp
+.DS_Store
