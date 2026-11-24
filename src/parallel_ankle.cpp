@@ -51,12 +51,6 @@ ActuatorSolution SolveSingle(const FootTransform& transform,
     if (!delta.allFinite()) {
         return result;
     }
-    // Normalize the closure equation to avoid squared-length overflow and
-    // absolute tolerances that change with a model's length unit.
-    const double scale = std::max({delta.cwiseAbs().maxCoeff(), bar, rod});
-    const Eigen::Vector3d r = delta / scale;
-    const double length = bar / scale;
-    constexpr double tolerance = 128.0 * std::numeric_limits<double>::epsilon();
     const double initial_side = foot_point.y() - motor_center.y();
     if (initial_side == 0.0) {
         result.status = InverseStatus::Singular;
@@ -69,8 +63,6 @@ ActuatorSolution SolveSingle(const FootTransform& transform,
         return result;
     }
     const double gamma = phase.gamma;
-    const Eigen::Vector3d crank(0.0, side * std::cos(gamma), std::sin(gamma));
-    const Eigen::Vector3d link = r - length * crank;
     const double direction = is_left_motor ? 1.0 : -1.0;
     result.theta = direction * gamma + offset;
     // A finite but very large encoder offset can erase gamma in theta=offset+gamma.
@@ -82,17 +74,27 @@ ActuatorSolution SolveSingle(const FootTransform& transform,
         failure.status = InverseStatus::NumericalFailure;
         return failure;
     }
-    const auto encoded_phase = detail::CheckCrankPhase(delta, bar, rod, side, encoded_gamma);
-    if (!encoded_phase.rod_closes || !encoded_phase.selected_working_root) {
-        ActuatorSolution failure;
-        failure.status = InverseStatus::NumericalFailure;
-        return failure;
+    // The phase solver already checked closure and the working root at gamma.
+    if (encoded_gamma != gamma) {
+        const auto encoded_phase = detail::CheckCrankPhase(delta, bar, rod, side, encoded_gamma);
+        if (!encoded_phase.rod_closes || !encoded_phase.selected_working_root) {
+            ActuatorSolution failure;
+            failure.status = InverseStatus::NumericalFailure;
+            return failure;
+        }
     }
     result.status = InverseStatus::Success;
     if (differentiate) {
-        const Eigen::Vector3d crank_derivative(0.0, -side * std::sin(gamma), std::cos(gamma));
+        const double scale = std::max({delta.cwiseAbs().maxCoeff(), bar, rod});
+        const Eigen::Vector3d r = delta / scale;
+        const double length = bar / scale;
+        const double sine = std::sin(gamma);
+        const double cosine = std::cos(gamma);
+        const Eigen::Vector3d crank(0.0, side * cosine, sine);
+        const Eigen::Vector3d link = r - length * crank;
+        const Eigen::Vector3d crank_derivative(0.0, -side * sine, cosine);
         const double transmission = length * r.dot(crank_derivative);
-        if (std::abs(transmission) <= tolerance * length * r.stableNorm()) {
+        if (std::abs(transmission) <= detail::kCrankBranchTolerance * length * r.stableNorm()) {
             return result;
         }
         const Eigen::Vector3d c_pitch = Eigen::Vector3d::UnitY().cross(pitch_relative / scale);
