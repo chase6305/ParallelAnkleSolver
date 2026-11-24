@@ -62,12 +62,11 @@ Evaluation EvaluateJacobian(const EqualityProblem& problem, const Eigen::VectorX
     return {};
 }
 
-Eigen::MatrixXd ScaledJacobian(const Eigen::MatrixXd& matrix,
-                               const Eigen::VectorXd& row_scales,
-                               const Eigen::VectorXd& column_scales) {
-    Eigen::MatrixXd scaled = matrix.array().colwise() / row_scales.array();
-    scaled.array().rowwise() *= column_scales.transpose().array();
-    return scaled;
+void ScaleJacobian(Eigen::MatrixXd& matrix,
+                   const Eigen::VectorXd& row_scales,
+                   const Eigen::VectorXd& column_scales) {
+    matrix.array().colwise() /= row_scales.array();
+    matrix.array().rowwise() *= column_scales.transpose().array();
 }
 
 double DampedInverse(double singular_value, double damping) {
@@ -131,6 +130,24 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
         result.message = evaluation.message;
         return result;
     }
+    Eigen::VectorXd residual = result.residual.cwiseQuotient(row_scales);
+    result.scaled_residual_norm = residual.stableNorm();
+    if (!residual.allFinite() || !std::isfinite(result.scaled_residual_norm)) {
+        result.status = Status::NumericalFailure;
+        result.message = "residual scaling overflowed";
+        return result;
+    }
+
+    Eigen::MatrixXd jacobian;
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd;
+    svd.setThreshold(options.rank_tolerance);
+    Eigen::VectorXd filter;
+    Eigen::VectorXd step;
+    Eigen::VectorXd unprojected;
+    Eigen::VectorXd candidate;
+    Eigen::VectorXd actual_step;
+    Eigen::VectorXd candidate_residual;
+    Eigen::VectorXd scaled_candidate_residual;
     bool small_step = false;
     for (int iteration = 0; iteration <= options.max_iterations; ++iteration) {
         result.iterations = iteration;
@@ -138,15 +155,6 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
         // regularity here if this iterate's callback or scaling fails.
         result.rank = 0;
         result.full_column_rank = false;
-        const Eigen::VectorXd residual = result.residual.cwiseQuotient(row_scales);
-        result.scaled_residual_norm = residual.stableNorm();
-        if (!residual.allFinite() || !std::isfinite(result.scaled_residual_norm)) {
-            result.status = Status::NumericalFailure;
-            result.message = "residual scaling overflowed";
-            return result;
-        }
-
-        Eigen::MatrixXd jacobian;
         ++result.jacobian_evaluations;
         evaluation = EvaluateJacobian(problem, result.x, jacobian);
         if (evaluation.status != Status::Success) {
@@ -154,14 +162,13 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
             result.message = evaluation.message;
             return result;
         }
-        jacobian = ScaledJacobian(jacobian, row_scales, column_scales);
+        ScaleJacobian(jacobian, row_scales, column_scales);
         if (!jacobian.allFinite()) {
             result.status = Status::NumericalFailure;
             result.message = "Jacobian scaling overflowed";
             return result;
         }
-        Eigen::JacobiSVD<Eigen::MatrixXd> svd(jacobian, Eigen::ComputeThinU | Eigen::ComputeThinV);
-        svd.setThreshold(options.rank_tolerance);
+        svd.compute(jacobian, Eigen::ComputeThinU | Eigen::ComputeThinV);
         if (svd.info() != Eigen::Success || !svd.singularValues().allFinite()) {
             result.status = Status::NumericalFailure;
             result.message = "Jacobian decomposition failed";
@@ -188,11 +195,11 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
             return result;
         }
 
-        Eigen::VectorXd filter = Eigen::VectorXd::Zero(svd.singularValues().size());
+        filter.setZero(svd.singularValues().size());
         for (Eigen::Index index = 0; index < result.rank; ++index) {
             filter(index) = DampedInverse(svd.singularValues()(index), options.damping);
         }
-        const Eigen::VectorXd step = -svd.matrixV() * filter.asDiagonal() * (svd.matrixU().transpose() * residual);
+        step = -svd.matrixV() * filter.asDiagonal() * (svd.matrixU().transpose() * residual);
         if (!step.allFinite()) {
             result.status = Status::NumericalFailure;
             result.message = "local correction overflowed";
@@ -207,10 +214,10 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
         double alpha = 1.0;
         Evaluation last_failure{Status::CallbackFailure, "no trial could be evaluated"};
         for (int attempt = 0; attempt < options.max_backtracking; ++attempt) {
-            const Eigen::VectorXd unprojected = result.x + (column_scales.array() * (alpha * step.array())).matrix();
-            const Eigen::VectorXd candidate = unprojected.cwiseMax(lower).cwiseMin(upper);
+            unprojected = result.x + (column_scales.array() * (alpha * step.array())).matrix();
+            candidate = unprojected.cwiseMax(lower).cwiseMin(upper);
             bounds_restricted = bounds_restricted || (candidate.array() != unprojected.array()).any();
-            const Eigen::VectorXd actual_step = (candidate - result.x).cwiseQuotient(column_scales);
+            actual_step = (candidate - result.x).cwiseQuotient(column_scales);
             const double step_norm = actual_step.stableNorm();
             const bool finite_trial = candidate.allFinite() && actual_step.allFinite() && std::isfinite(step_norm);
             any_finite_trial = any_finite_trial || finite_trial;
@@ -219,7 +226,6 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
             }
             if (finite_trial && step_norm > 0.0) {
                 any_movement = true;
-                Eigen::VectorXd candidate_residual;
                 ++result.residual_evaluations;
                 evaluation = EvaluateResidual(problem, candidate, candidate_residual);
                 if (evaluation.status == Status::InvalidEvaluation) {
@@ -228,13 +234,15 @@ SolveResult SolveEqualities(const EqualityProblem& problem, const Eigen::VectorX
                     return result;
                 }
                 if (evaluation.status == Status::Success) {
-                    const Eigen::VectorXd scaled = candidate_residual.cwiseQuotient(row_scales);
-                    const double norm = scaled.stableNorm();
-                    if (scaled.allFinite() && std::isfinite(norm)) {
+                    scaled_candidate_residual = candidate_residual.cwiseQuotient(row_scales);
+                    const double norm = scaled_candidate_residual.stableNorm();
+                    if (scaled_candidate_residual.allFinite() && std::isfinite(norm)) {
                         any_valid_trial = true;
                         if (norm <= options.residual_tolerance || norm < result.scaled_residual_norm) {
                             result.x = candidate;
                             result.residual = candidate_residual;
+                            result.scaled_residual_norm = norm;
+                            residual.swap(scaled_candidate_residual);
                             result.scaled_step_norm = step_norm;
                             small_step = step_norm <= options.step_tolerance;
                             accepted = true;
@@ -282,7 +290,8 @@ DerivativeResult DifferentiateImplicitly(const Eigen::MatrixXd& a,
     result.derivative = Eigen::MatrixXd::Constant(a.cols(), b.cols(), std::numeric_limits<double>::quiet_NaN());
     const auto row_scales = ScalesOrOnes(options.equation_scales, a.rows());
     const auto column_scales = ScalesOrOnes(options.variable_scales, a.cols());
-    const Eigen::MatrixXd normalized_a = ScaledJacobian(a, row_scales, column_scales);
+    Eigen::MatrixXd normalized_a = a;
+    ScaleJacobian(normalized_a, row_scales, column_scales);
     const Eigen::MatrixXd normalized_b = b.array().colwise() / row_scales.array();
     if (!normalized_a.allFinite() || !normalized_b.allFinite()) {
         result.status = Status::NumericalFailure;

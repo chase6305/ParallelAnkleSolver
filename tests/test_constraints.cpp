@@ -186,6 +186,41 @@ TEST(EqualityConstraints, DistinguishMalformedAndFailedCallbacks) {
     EXPECT_EQ(SolveEqualities(problem, Eigen::VectorXd::Zero(1)).status, Status::InvalidEvaluation);
 }
 
+TEST(EqualityConstraints, RejectPartiallyWrittenOutputsAfterASuccessfulEvaluation) {
+    for (bool omit_jacobian_entry : {false, true}) {
+        SCOPED_TRACE(omit_jacobian_entry);
+        int residual_calls = 0;
+        int jacobian_calls = 0;
+        EqualityProblem problem;
+        problem.variables = problem.equations = 2;
+        problem.residual = [&](const Eigen::VectorXd& x, Eigen::VectorXd& residual) {
+            residual(0) = x(0) * x(0) - 1.0;
+            ++residual_calls;
+            if (omit_jacobian_entry || residual_calls <= 2) {
+                residual(1) = x(1) - 2.0;
+            }
+            return true;
+        };
+        problem.jacobian = [&](const Eigen::VectorXd& x, Eigen::MatrixXd& jacobian) {
+            jacobian(0, 0) = 2.0 * x(0);
+            jacobian(0, 1) = jacobian(1, 0) = 0.0;
+            ++jacobian_calls;
+            if (!omit_jacobian_entry || jacobian_calls == 1) {
+                jacobian(1, 1) = 1.0;
+            }
+            return true;
+        };
+        SolveOptions options;
+        options.damping = 0.0;
+        const auto result = SolveEqualities(problem, Eigen::Vector2d(0.5, 0.0), options);
+        EXPECT_EQ(result.status, Status::InvalidEvaluation);
+        EXPECT_EQ(result.iterations, 1);
+        EXPECT_EQ(result.x, Eigen::Vector2d(1.25, 2.0));
+        EXPECT_EQ(result.residual_evaluations, omit_jacobian_entry ? 2 : 3);
+        EXPECT_EQ(result.jacobian_evaluations, 2);
+    }
+}
+
 TEST(EqualityConstraints, InvalidatePreviousRankWhenANewJacobianEvaluationFails) {
     for (bool nonfinite_output : {false, true}) {
         auto problem = ScalarAffine(1.0);
