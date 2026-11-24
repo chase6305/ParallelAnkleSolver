@@ -16,7 +16,7 @@ Motors at `A₁` and `A₂` drive cranks `AᵢBᵢ`. The fixed-length rods `Bᵢ
 
 ![Planar five-bar. Two driven links extend from a fixed base to elbow joints. The distal links meet at the foot point, with dashed lines showing a second possible intersection.](docs/figures/planar-five-bar.png)
 
-The fixed base `A₁A₂`, two driven links, and two distal links form the closed loop. Motor angles `θ₁` and `θ₂` locate elbows `E₁` and `E₂`. The distal links can meet at `P` or `P′`, giving two assembly modes for the same motor angles. `PlanarFiveBar` uses the planar foot position `[x, y]` as its task coordinate. The diagram uses the asymmetric `five_bar_demo` geometry. [Five-bar coordinates and branches](docs/backends.md#一般平面五杆)
+The fixed base `A₁A₂`, two driven links, and two distal links form the closed loop. Motor angles `θ₁` and `θ₂` locate elbows `E₁` and `E₂`. The distal links can meet at `P` or `P′`, giving two assembly modes for the same motor angles. `PlanarFiveBar` uses the planar foot position `[x, y]` as its task coordinate. The schematic is based on the asymmetric `five_bar_demo` example. [Five-bar coordinates and branches](docs/backends.md#一般平面五杆)
 
 ### Dual linear-drive spatial ankle
 
