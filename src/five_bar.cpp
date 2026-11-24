@@ -40,29 +40,38 @@ Point Crank(long double angle, long double length) {
     return Point{std::cos(angle), std::sin(angle)} * length;
 }
 
-std::array<Point, 2> RodVectors(Point position,
-                               const std::array<Point, 2>& pivots,
-                               const std::array<Point, 2>& cranks) {
-    return {(position - pivots[0]) - cranks[0], (position - pivots[1]) - cranks[1]};
+struct MeasuredLinks {
+    std::array<Point, 2> vectors;
+    std::array<long double, 2> lengths;
+};
+
+MeasuredLinks MeasureLinks(const std::array<Point, 2>& vectors) {
+    return {vectors, {Norm(vectors[0]), Norm(vectors[1])}};
 }
 
-int CrossSign(Point first, Point second, long double second_length) {
-    const long double scale = Norm(first) * second_length;
+MeasuredLinks RodsAt(Point position,
+                     const std::array<Point, 2>& pivots,
+                     const std::array<Point, 2>& cranks) {
+    return MeasureLinks({(position - pivots[0]) - cranks[0], (position - pivots[1]) - cranks[1]});
+}
+
+int CrossSign(Point first, Point second, long double length_product) {
     const long double value = Cross(first, second);
-    if (std::abs(value) <= kBranchRoundoff * scale) {
+    if (std::abs(value) <= kBranchRoundoff * length_product) {
         return 0;
     }
     return value > 0.0L ? 1 : -1;
 }
 
 FiveBarBranch Branch(Point elbow_delta,
-                     const std::array<Point, 2>& cranks,
-                     const std::array<Point, 2>& rods) {
+                     long double elbow_distance,
+                     const MeasuredLinks& cranks,
+                     const MeasuredLinks& rods) {
     FiveBarBranch branch;
-    const long double first_rod_length = Norm(rods[0]);
-    branch.assembly = CrossSign(elbow_delta, rods[0], first_rod_length);
-    branch.working[0] = CrossSign(cranks[0], rods[0], first_rod_length);
-    branch.working[1] = CrossSign(cranks[1], rods[1], Norm(rods[1]));
+    branch.assembly = CrossSign(elbow_delta, rods.vectors[0], elbow_distance * rods.lengths[0]);
+    for (int leg = 0; leg < 2; ++leg) {
+        branch.working[leg] = CrossSign(cranks.vectors[leg], rods.vectors[leg], cranks.lengths[leg] * rods.lengths[leg]);
+    }
     return branch;
 }
 
@@ -101,8 +110,8 @@ bool RodClosed(long double actual, long double required_length) {
     return actual > 0.0L && std::isfinite(actual) && std::abs(actual - required_length) <= tolerance;
 }
 
-bool RodsClosed(const std::array<Point, 2>& rods, const std::array<double, 2>& required_lengths) {
-    return RodClosed(Norm(rods[0]), required_lengths[0]) && RodClosed(Norm(rods[1]), required_lengths[1]);
+bool RodsClosed(const MeasuredLinks& rods, const std::array<double, 2>& required_lengths) {
+    return RodClosed(rods.lengths[0], required_lengths[0]) && RodClosed(rods.lengths[1], required_lengths[1]);
 }
 
 double CanonicalAngle(long double angle) {
@@ -118,6 +127,8 @@ struct LegSolution {
     double angle = 0.0;
     Point crank{};
     Point rod{};
+    long double rod_length = 0.0L;
+    int working_mode = 0;
 };
 
 struct LegInverse {
@@ -155,11 +166,13 @@ LegInverse InverseLeg(Point target, long double proximal, long double distal) {
         auto& solution = result.solutions[index];
         solution.crank = Crank(solution.angle, proximal);
         solution.rod = target - solution.crank;
-        if (!RodClosed(Norm(solution.rod), distal)) {
+        solution.rod_length = Norm(solution.rod);
+        if (!RodClosed(solution.rod_length, distal)) {
             result.status = FiveBarStatus::NumericalFailure;
             result.count = 0;
             return result;
         }
+        solution.working_mode = CrossSign(solution.crank, solution.rod, Norm(solution.crank) * solution.rod_length);
     }
     result.status = FiveBarStatus::Success;
     return result;
@@ -234,18 +247,19 @@ FiveBarForwardResult PlanarFiveBar::ForwardAll(const Eigen::Vector2d& motor_angl
         result.status = FiveBarStatus::NumericalFailure;
         return result;
     }
-    const auto positive_rods = RodVectors(Extended(positive), pivots, cranks);
-    const auto negative_rods = RodVectors(Extended(negative), pivots, cranks);
+    const auto positive_rods = RodsAt(Extended(positive), pivots, cranks);
+    const auto negative_rods = RodsAt(Extended(negative), pivots, cranks);
     if (!RodsClosed(positive_rods, params_.distal) || !RodsClosed(negative_rods, params_.distal)) {
         result.status = FiveBarStatus::NumericalFailure;
         return result;
     }
+    const auto measured_cranks = MeasureLinks(cranks);
     result.solutions[0].position = positive;
-    result.solutions[0].branch = Branch(delta, cranks, positive_rods);
+    result.solutions[0].branch = Branch(delta, distance, measured_cranks, positive_rods);
     result.count = 1;
     if (!(positive.array() == negative.array()).all()) {
         result.solutions[1].position = negative;
-        result.solutions[1].branch = Branch(delta, cranks, negative_rods);
+        result.solutions[1].branch = Branch(delta, distance, measured_cranks, negative_rods);
         result.count = 2;
     }
     result.status = FiveBarStatus::Success;
@@ -281,9 +295,10 @@ FiveBarInverseResult PlanarFiveBar::InverseAll(const Eigen::Vector2d& position) 
             const auto& right_solution = second.solutions[right];
             auto& solution = result.solutions[result.count++];
             solution.motor_angles = {left_solution.angle, right_solution.angle};
-            const std::array<Point, 2> cranks{left_solution.crank, right_solution.crank};
-            const Point elbow_delta = pivot_delta + (cranks[1] - cranks[0]);
-            solution.branch = Branch(elbow_delta, cranks, {left_solution.rod, right_solution.rod});
+            const Point elbow_delta = pivot_delta + (right_solution.crank - left_solution.crank);
+            solution.branch.assembly = CrossSign(elbow_delta, left_solution.rod,
+                                                 Norm(elbow_delta) * left_solution.rod_length);
+            solution.branch.working = {left_solution.working_mode, right_solution.working_mode};
         }
     }
     result.status = FiveBarStatus::Success;
@@ -302,15 +317,15 @@ FiveBarDifferential PlanarFiveBar::Analyze(const Eigen::Vector2d& position,
     const std::array<Point, 2> pivots{Extended(params_.pivots[0]), Extended(params_.pivots[1])};
     const std::array<Point, 2> cranks{Crank(motor_angles(0), params_.proximal[0]),
                                       Crank(motor_angles(1), params_.proximal[1])};
-    const auto rods = RodVectors(Extended(position), pivots, cranks);
+    const auto rods = RodsAt(Extended(position), pivots, cranks);
     std::array<Point, 2> units;
     for (int leg = 0; leg < 2; ++leg) {
-        const long double distance = Norm(rods[leg]);
+        const long double distance = rods.lengths[leg];
         if (!RodClosed(distance, params_.distal[leg])) {
             result.status = FiveBarStatus::Unreachable;
             return result;
         }
-        units[leg] = rods[leg] / distance;
+        units[leg] = rods.vectors[leg] / distance;
         result.A.row(leg) << static_cast<double>(units[leg].x), static_cast<double>(units[leg].y);
         const long double diagonal = Dot(units[leg], Point{-cranks[leg].y, cranks[leg].x});
         result.B(leg, leg) = static_cast<double>(diagonal);
@@ -318,7 +333,7 @@ FiveBarDifferential PlanarFiveBar::Analyze(const Eigen::Vector2d& position,
                                    std::abs(diagonal) <= singular_tolerance * params_.proximal[leg];
     }
     const Point elbow_delta = (pivots[1] - pivots[0]) + (cranks[1] - cranks[0]);
-    result.branch = Branch(elbow_delta, cranks, rods);
+    result.branch = Branch(elbow_delta, Norm(elbow_delta), MeasureLinks(cranks), rods);
     result.assembly_singular = std::abs(Cross(units[0], units[1])) <= singular_tolerance;
     if (!result.A.allFinite() || !result.B.allFinite()) {
         result.status = FiveBarStatus::NumericalFailure;
